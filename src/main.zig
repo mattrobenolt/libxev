@@ -74,10 +74,7 @@ pub const DynamicXev = @import("dynamic.zig").Xev;
 /// don't use any interface it will NOT be compiled (yay!).
 const Xev = @import("api.zig").Xev;
 pub const IO_Uring = Xev(.io_uring, @import("backend/io_uring.zig"));
-pub const Epoll = Xev(.epoll, @import("backend/epoll.zig"));
 pub const Kqueue = Xev(.kqueue, @import("backend/kqueue.zig"));
-pub const WasiPoll = Xev(.wasi_poll, @import("backend/wasi_poll.zig"));
-pub const IOCP = Xev(.iocp, @import("backend/iocp.zig"));
 
 /// Generic thread pool implementation.
 pub const ThreadPool = @import("ThreadPool.zig");
@@ -98,28 +95,11 @@ test {
     _ = ThreadPool;
     _ = Dynamic;
 
-    // Test the C API
-    if (builtin.os.tag != .wasi) _ = @import("c_api.zig");
-
     // OS-specific tests
     switch (builtin.os.tag) {
         .linux => {
-            _ = Epoll;
             _ = IO_Uring;
             _ = @import("linux/timerfd.zig");
-        },
-
-        .freebsd => {
-            _ = Kqueue;
-        },
-
-        .wasi => {
-            //_ = WasiPoll;
-            _ = @import("backend/wasi_poll.zig");
-        },
-
-        .windows => {
-            _ = @import("backend/iocp.zig");
         },
 
         else => {},

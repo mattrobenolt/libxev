@@ -33,7 +33,7 @@ pub fn File(comptime xev: type) type {
 fn FileStream(comptime xev: type) type {
     return struct {
         const Self = @This();
-        const FdType = if (xev.backend == .iocp) std.os.windows.HANDLE else posix.socket_t;
+        const FdType = posix.socket_t;
 
         /// The underlying file
         fd: FdType,
@@ -122,14 +122,7 @@ fn FileStream(comptime xev: type) type {
 
                     // If we're dup-ing, then we ask the backend to manage the fd.
                     switch (xev.backend) {
-                        .io_uring,
-                        .wasi_poll,
-                        .iocp,
-                        => {},
-
-                        .epoll => {
-                            c.flags.threadpool = true;
-                        },
+                        .io_uring => {},
 
                         .kqueue => kqueue: {
                             // If we're not reading any actual data, we don't
@@ -293,14 +286,7 @@ fn FileStream(comptime xev: type) type {
 
                     // If we're dup-ing, then we ask the backend to manage the fd.
                     switch (xev.backend) {
-                        .io_uring,
-                        .wasi_poll,
-                        .iocp,
-                        => {},
-
-                        .epoll => {
-                            c.flags.threadpool = true;
-                        },
+                        .io_uring => {},
 
                         .kqueue => {
                             c.flags.threadpool = true;
@@ -555,9 +541,6 @@ fn FileTests(
         }
 
         test "poll" {
-            if (builtin.os.tag == .wasi) return error.SkipZigTest;
-            if (builtin.os.tag == .windows) return error.SkipZigTest;
-
             const testing = std.testing;
 
             var loop = try xev.Loop.init(.{});
@@ -594,12 +577,6 @@ fn FileTests(
         }
 
         test "read/write" {
-            // wasi: local files don't work with poll (always ready)
-            if (builtin.os.tag == .wasi) return error.SkipZigTest;
-            // windows: std.fs.File is not opened with OVERLAPPED flag.
-            if (builtin.os.tag == .windows) return error.SkipZigTest;
-            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
-
             const testing = std.testing;
 
             var tpool = main.ThreadPool.init(.{});
@@ -669,12 +646,6 @@ fn FileTests(
         }
 
         test "pread/pwrite" {
-            // wasi: local files don't work with poll (always ready)
-            if (builtin.os.tag == .wasi) return error.SkipZigTest;
-            // windows: std.fs.File is not opened with OVERLAPPED flag.
-            if (builtin.os.tag == .windows) return error.SkipZigTest;
-            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
-
             const testing = std.testing;
 
             var tpool = main.ThreadPool.init(.{});
@@ -742,12 +713,6 @@ fn FileTests(
         }
 
         test "queued writes" {
-            // wasi: local files don't work with poll (always ready)
-            if (builtin.os.tag == .wasi) return error.SkipZigTest;
-            // windows: std.fs.File is not opened with OVERLAPPED flag.
-            if (builtin.os.tag == .windows) return error.SkipZigTest;
-            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
-
             const testing = std.testing;
 
             var tpool = main.ThreadPool.init(.{});

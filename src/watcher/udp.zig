@@ -19,18 +19,10 @@ pub fn UDP(comptime xev: type) type {
 
     return switch (xev.backend) {
         // Supported, uses sendmsg/recvmsg exclusively
-        .io_uring,
-        .epoll,
-        => UDPSendMsg(xev),
+        .io_uring => UDPSendMsg(xev),
 
         // Supported, uses sendto/recvfrom
         .kqueue => UDPSendto(xev),
-
-        // Supported with tweaks
-        .iocp => UDPSendtoIOCP(xev),
-
-        // Noop
-        .wasi_poll => struct {},
     };
 }
 
@@ -213,183 +205,6 @@ fn UDPSendto(comptime xev: type) type {
     };
 }
 
-/// UDP implementation that uses sendto/recvfrom.
-fn UDPSendtoIOCP(comptime xev: type) type {
-    return struct {
-        const Self = @This();
-        const windows = std.os.windows;
-
-        fd: windows.HANDLE,
-
-        /// See UDPSendMsg.State
-        pub const State = struct {
-            userdata: ?*anyopaque,
-        };
-
-        const S = stream.Stream(xev, Self, .{
-            .close = true,
-        });
-        pub const close = S.close;
-
-        /// Initialize a new UDP with the family from the given address. Only
-        /// the family is used, the actual address has no impact on the created
-        /// resource.
-        pub fn init(addr: std.net.Address) !Self {
-            const socket = try windows.WSASocketW(addr.any.family, posix.SOCK.DGRAM, 0, null, 0, windows.ws2_32.WSA_FLAG_OVERLAPPED);
-
-            return .{
-                .fd = socket,
-            };
-        }
-
-        /// Initialize a UDP socket from a file descriptor.
-        pub fn initFd(fd: windows.HANDLE) Self {
-            return .{
-                .fd = fd,
-            };
-        }
-
-        /// Bind the address to the socket.
-        pub fn bind(self: Self, addr: std.net.Address) !void {
-            const socket = @as(windows.ws2_32.SOCKET, @ptrCast(self.fd));
-            try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-            try posix.bind(socket, &addr.any, addr.getOsSockLen());
-        }
-
-        /// Read from the socket. This performs a single read. The callback must
-        /// requeue the read if additional reads want to be performed. Additional
-        /// reads simultaneously can be queued by calling this multiple times. Note
-        /// that depending on the backend, the reads can happen out of order.
-        ///
-        /// TODO(mitchellh): a way to receive the remote addr
-        pub fn read(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            s: *State,
-            buf: xev.ReadBuffer,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: *State,
-                addr: std.net.Address,
-                s: Self,
-                b: xev.ReadBuffer,
-                r: xev.ReadError!usize,
-            ) xev.CallbackAction,
-        ) void {
-            s.* = .{
-                .userdata = userdata,
-            };
-
-            switch (buf) {
-                inline .slice, .array => {
-                    c.* = .{
-                        .op = .{
-                            .recvfrom = .{
-                                .fd = self.fd,
-                                .buffer = buf,
-                            },
-                        },
-                        .userdata = s,
-                        .callback = (struct {
-                            fn callback(
-                                ud: ?*anyopaque,
-                                l_inner: *xev.Loop,
-                                c_inner: *xev.Completion,
-                                r: xev.Result,
-                            ) xev.CallbackAction {
-                                const s_inner: *State = @ptrCast(@alignCast(ud.?));
-                                return @call(.always_inline, cb, .{
-                                    common.userdataValue(Userdata, s_inner.userdata),
-                                    l_inner,
-                                    c_inner,
-                                    s_inner,
-                                    std.net.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)),
-                                    initFd(c_inner.op.recvfrom.fd),
-                                    c_inner.op.recvfrom.buffer,
-                                    r.recvfrom,
-                                });
-                            }
-                        }).callback,
-                    };
-
-                    loop.add(c);
-                },
-            }
-        }
-
-        /// Write to the socket. This performs a single write. Additional writes
-        /// can be queued by calling this multiple times. Note that depending on the
-        /// backend, writes can happen out of order.
-        pub fn write(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            s: *State,
-            addr: std.net.Address,
-            buf: xev.WriteBuffer,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: *State,
-                s: Self,
-                b: xev.WriteBuffer,
-                r: xev.WriteError!usize,
-            ) xev.CallbackAction,
-        ) void {
-            s.* = .{
-                .userdata = userdata,
-            };
-
-            switch (buf) {
-                inline .slice, .array => {
-                    c.* = .{
-                        .op = .{
-                            .sendto = .{
-                                .fd = self.fd,
-                                .buffer = buf,
-                                .addr = addr,
-                            },
-                        },
-                        .userdata = s,
-                        .callback = (struct {
-                            fn callback(
-                                ud: ?*anyopaque,
-                                l_inner: *xev.Loop,
-                                c_inner: *xev.Completion,
-                                r: xev.Result,
-                            ) xev.CallbackAction {
-                                const s_inner: *State = @ptrCast(@alignCast(ud.?));
-                                return @call(.always_inline, cb, .{
-                                    common.userdataValue(Userdata, s_inner.userdata),
-                                    l_inner,
-                                    c_inner,
-                                    s_inner,
-                                    initFd(c_inner.op.sendto.fd),
-                                    c_inner.op.sendto.buffer,
-                                    r.sendto,
-                                });
-                            }
-                        }).callback,
-                    };
-
-                    loop.add(c);
-                },
-            }
-        }
-
-        test {
-            _ = UDPTests(xev, Self);
-        }
-    };
-}
 
 /// UDP implementation that uses sendmsg/recvmsg
 fn UDPSendMsg(comptime xev: type) type {
@@ -551,13 +366,7 @@ fn UDPSendMsg(comptime xev: type) type {
 
             // If we're dup-ing, then we ask the backend to manage the fd.
             switch (xev.backend) {
-                .io_uring,
-                .kqueue,
-                .wasi_poll,
-                .iocp,
-                => {},
-
-                .epoll => c.flags.dup = true,
+                .io_uring, .kqueue => {},
             }
 
             loop.add(c);
@@ -623,7 +432,7 @@ fn UDPSendMsg(comptime xev: type) type {
                 },
             }
 
-            // On backends like epoll, you watch file descriptors for
+            // On backends like kqueue, you watch file descriptors for
             // specific events. Our implementation doesn't merge multiple
             // completions for a single fd, so we have to dup the fd. This
             // means we use more fds than we could optimally. This isn't a
@@ -661,13 +470,7 @@ fn UDPSendMsg(comptime xev: type) type {
 
             // If we're dup-ing, then we ask the backend to manage the fd.
             switch (xev.backend) {
-                .io_uring,
-                .kqueue,
-                .wasi_poll,
-                .iocp,
-                => {},
-
-                .epoll => c.flags.dup = true,
+                .io_uring, .kqueue => {},
             }
 
             loop.add(c);
@@ -682,10 +485,7 @@ fn UDPSendMsg(comptime xev: type) type {
 fn UDPDynamic(comptime xev: type) type {
     return struct {
         const Self = @This();
-        const FdType = if (builtin.os.tag == .windows)
-            std.os.windows.HANDLE
-        else
-            posix.socket_t;
+        const FdType = posix.socket_t;
 
         backend: Union,
 
@@ -912,7 +712,6 @@ fn UDPTests(comptime xev: type, comptime Impl: type) type {
         }
 
         test "UDP: read/write" {
-            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
             const testing = std.testing;
 
             var tpool = ThreadPool.init(.{});

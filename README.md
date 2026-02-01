@@ -2,10 +2,8 @@
 
 libxev is a cross-platform event loop. libxev provides a unified event loop
 abstraction for non-blocking IO, timers, signals, events, and more that
-works on macOS, Windows, Linux, and WebAssembly (browser and WASI). It is
-written in [Zig](https://ziglang.org/) but exports a C-compatible API (which
-further makes it compatible with any language out there that can communicate
-with C APIs).
+works on Linux (io_uring) and macOS (kqueue). It is written in
+[Zig](https://ziglang.org/).
 
 **Project Status: Stable for most use cases.** libxev is in daily use by
 large projects such as [Ghostty](https://ghostty.org),
@@ -20,17 +18,13 @@ being a key word here). Two, I wanted to build a library like this around
 the design patterns of [io_uring](https://unixism.net/loti/what_is_io_uring.html),
 even mimicking its style on top of other OS primitives (
 [credit to this awesome blog post](https://tigerbeetle.com/blog/a-friendly-abstraction-over-iouring-and-kqueue/)).
-Three, I wanted an event loop library that could build to WebAssembly
-(both WASI and freestanding) and that didn't really fit well
-into the goals of API style of existing libraries without bringing in
-something super heavy like Emscripten. The motivation for this library
-primarily though is scratching my own itch!
+Three, I wanted an event loop library that felt at home in Zig and its
+build ecosystem. The motivation for this library primarily though is
+scratching my own itch!
 
 ## Features
 
-**Cross-platform.** Linux (`io_uring` and `epoll`), macOS (`kqueue`),
-WebAssembly + WASI (`poll_oneoff`, threaded and non-threaded runtimes).
-(Windows support is planned and coming soon)
+**Cross-platform.** Linux (`io_uring`), macOS (`kqueue`).
 
 **[Proactor API](https://en.wikipedia.org/wiki/Proactor_pattern).** Work
 is submitted to the libxev event loop and the caller is notified of
@@ -68,8 +62,7 @@ support optional "nice-to-have" functionality that may be considered
 "bloat" in some cases, but the end user doesn't have to pay for it.
 
 **Dependency-free.** libxev has no dependencies other than the built-in
-OS APIs at runtime. The C library depends on libc. This makes it very
-easy to cross-compile.
+OS APIs at runtime. This makes it very easy to cross-compile.
 
 ### Roadmap
 
@@ -78,8 +71,7 @@ There are plenty of missing features that I still want to add:
 * Pipe high-level API
 * Signal handlers
 * Filesystem events
-* Windows backend
-* Freestanding WebAssembly support via an external event loop (i.e. the browser)
+* Filesystem events for more platforms
 
 And more...
 
@@ -100,17 +92,7 @@ in resolving it!
 
 ## Example
 
-The example below shows an identical program written in Zig and in C
-that uses libxev to run a single 5s timer. This is almost silly how
-simple it is but is meant to just convey the overall feel of the library
-rather than a practical use case.
-
-<table>
-<tr>
-<td> Zig </td> <td> C </td>
-</tr>
-<tr>
-<td>
+The example below shows a single 5s timer.
 
 ```zig
 const xev = @import("xev");
@@ -135,58 +117,15 @@ fn timerCallback(
     c: *xev.Completion,
     result: xev.Timer.RunError!void,
 ) xev.CallbackAction {
-   _ = userdata;
-   _ = loop;
-   _ = c;
-   _ = result catch unreachable;
-   return .disarm;
+    _ = userdata;
+    _ = loop;
+    _ = c;
+    _ = result catch unreachable;
+    return .disarm;
 }
 ```
-
-</td>
-<td>
-
-```c
-#include <stddef.h>
-#include <stdio.h>
-#include <xev.h>
-
-xev_cb_action timerCallback(xev_loop* loop, xev_completion* c, int result, void *userdata) {
-    return XEV_DISARM;
-}
-
-int main(void) {
-    xev_loop loop;
-    if (xev_loop_init(&loop) != 0) {
-        printf("xev_loop_init failure\n");
-        return 1;
-    }
-
-    xev_watcher w;
-    if (xev_timer_init(&w) != 0) {
-        printf("xev_timer_init failure\n");
-        return 1;
-    }
-
-    xev_completion c;
-    xev_timer_run(&w, &loop, &c, 5000, NULL, &timerCallback);
-
-    xev_loop_run(&loop, XEV_RUN_UNTIL_DONE);
-
-    xev_timer_deinit(&w);
-    xev_loop_deinit(&loop);
-    return 0;
-}
-```
-
-</td>
-</tr>
-</table>
 
 ## Installation (Zig)
-
-**These instructions are for Zig downstream users only.** If you are
-using the C API to libxev, see the "Build" section.
 
 This package works with the Zig package manager introduced in Zig 0.11.
 Create a `build.zig.zon` file like this:
@@ -223,10 +162,8 @@ available.
 ### Man Pages
 
 The man pages are relatively detailed! `xev(7)` will
-give you a good overview of the entire library. `xev-zig(7)` and
-`xev-c(7)` will provide overviews of the Zig and C API, respectively.
-From there, API-specifc man pages such as `xev_loop_init(3)` are
-available. This is the best documentation currently.
+give you a good overview of the entire library. `xev-zig(7)` provides
+an overview of the Zig API. This is the best documentation currently.
 
 There are multiple ways to browse the man pages. The most immediately friendly
 is to just browse the raw man page sources in the `docs/` directory in
@@ -249,20 +186,19 @@ into your man path, so you can just do `man 7 xev`.
 
 ### Examples
 
-There are examples available in the `examples/` folder. The examples are
-available in both C and Zig, and you can tell which one is which using
-the file extension.
+There are examples available in the `examples/` folder. The examples
+are Zig-only.
 
 To build an example, use the following:
 
 ```
-$ zig build -Dexample-name=_basic.zig
+$ zig build -Demit-example
 ...
-$ zig-out/bin/example-basic
+$ zig-out/bin/example/_basic
 ...
 ```
 
-The `-Dexample-name` value should be the filename including the extension.
+The `-Demit-example` flag installs all Zig examples into `zig-out/bin/example`.
 
 ### Code Comments
 
@@ -292,9 +228,8 @@ $ zig build test
 ...
 ```
 
-This will run all the tests for all the supported features for the current
-host platform. For example, on Linux this will run both the full io_uring
-and epoll test suite.
+This will run all the tests for the supported features for the current
+host platform.
 
 **You can build and run tests for other platforms** by cross-compiling the
  test executable, copying it to a target machine and executing it. For example,
@@ -306,12 +241,4 @@ and epoll test suite.
 
  $ file zig-out/bin/xev-test
  zig-out/bin/xev-test: Mach-O 64-bit arm64 executable
- ```
-
- **WASI is a special-case.** You can run tests for WASI if you have
- [wasmtime](https://wasmtime.dev/) installed:
-
- ```
- $ zig build test -Dtarget=wasm32-wasi -Dwasmtime
- ...
  ```

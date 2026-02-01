@@ -8,19 +8,15 @@ libxev - high-performance, cross-platform event loop
 
 *libxev* is a high-performance, cross-platform event loop. libxev provides a
 unified event loop abstraction for non-blocking IO, timers, signals, events,
-and more that works on macOS, Windows, Linux, and WebAssembly (browser and WASI).
-It is written in Zig but exports a C-compatible API (which makes it compatible
-with any language out there that can communicate with C APIs).
+and more that works on Linux (io_uring) and macOS (kqueue).
+It is written in Zig.
 
 This manual will focus on general libxev concepts. For details specific
-to the C API see xev-c(7) and for details specific to the Zig API see
-xev-zig(7).
+to the Zig API see xev-zig(7).
 
 # FEATURES
 
-*Cross-platform.* Linux (io_uring(7) and epoll(7)), macOS (kqueue(2)),
-WebAssembly + WASI (poll_oneoff(2), threaded and non-threaded runtimes).
-(Windows support is planned and coming soon)
+*Cross-platform.* Linux (io_uring(7)), macOS (kqueue(2)).
 
 *Proactor API.* Work is submitted to the libxev event loop and the caller
 is notified of work _completion_, as opposed to work _readiness_.
@@ -55,8 +51,7 @@ support optional "nice-to-have" functionality that may be considered
 "bloat" in some cases, but the end user doesn't have to pay for it.
 
 *Dependency-free.* libxev has no dependencies other than the built-in
-OS APIs at runtime. The C library depends on libc. This makes it very
-easy to cross-compile.
+OS APIs at runtime. This makes it very easy to cross-compile.
 
 # EVENT LOOP PROGRAMMING
 
@@ -70,7 +65,7 @@ There are two popular event loop styles: _proactor_ and _reactor_.
 The reactor pattern notifies the event loop user of task _readiness_,
 whereas the proactor pattern notifies the event loop user of task _completion_.
 Examples of reactor APIs: POSIX poll(2), BSD kqueue(2). Examples of proactor
-APIs: Linux io_uring(7), Windows IOCP, and JavaScript IO callbacks.
+APIs: Linux io_uring(7) and JavaScript IO callbacks.
 *libxev is a proactor event loop.*
 
 # LIBXEV GENERAL CONCEPTS
@@ -107,10 +102,10 @@ of a programmer-provided memory location.
 
 ## LOOPS
 
-The `xev.Loop` (Zig) and `xev_loop` (C) types represent a single event
-loop. A program may have multiple event loops, but most typically there
-is at most one per thread. If you are just getting started, just use a
-single event loop per thread until you're more comfortable with the API.
+The `xev.Loop` (Zig) type represents a single event loop. A program may
+have multiple event loops, but most typically there is at most one per
+thread. If you are just getting started, just use a single event loop per
+thread until you're more comfortable with the API.
 
 Completions are _added_ to the event loop. Completions are explained
 in more detail in the next section but at a high level represent a request
@@ -118,7 +113,7 @@ to perform some work. The event loop does NOT begin performing any work
 until the loop is run. This is important, so to repeat it in another way:
 an _added_ completion does nothing until the next time a loop is run.
 
-An event loop is _run_ with `loop.run` (Zig) or xev_loop_run(3) (C).
+An event loop is _run_ with `loop.run`.
 The first thing the event loop does is _submit_ any _added_ completions.
 Submitted completions begin their requested work in the background. If a
 completion doesn't complete and the loop run returns (such as with a "no wait"
@@ -148,9 +143,9 @@ can copy the loop value. However, once the loop has run any times
 
 ## COMPLETIONS
 
-The `xev.Completion` (Zig) and `xev_completion` (C) types represent a
-single request to do some work, such as read or write a file, accept
-a network connection, sleep on a timer, etc.
+The `xev.Completion` (Zig) type represents a single request to do some
+work, such as read or write a file, accept a network connection, sleep
+on a timer, etc.
 
 Completions do nothing until they are _added_ to an event loop (and
 even then, do nothing until the next event loop tick). Completions must
@@ -227,57 +222,6 @@ Some callback tips for common behaviors:
   for an active completion except after the callback is fired (or the
   event loop is deinitialized).
 
-# EXAMPLE (C)
-
-The example below shows how the C API can be used to initialize an event
-loop and run a 5 second timer. To learn more about the C API, see
-xev-c(7).
-
-```
-#include <stddef.h>
-#include <stdio.h>
-#include <xev.h>
-
-xev_cb_action timerCallback(xev_loop* loop, xev_completion* c, int result, void *userdata) {
-    return XEV_DISARM;
-}
-
-int main(void) {
-    // Initialize the loop state. Notice we can use a stack-allocated
-    // value here. We can even pass around the loop by value! The loop
-    // will contain all of our "completions" (watches).
-    xev_loop loop;
-    if (xev_loop_init(&loop, 128) != 0) {
-        printf("xev_loop_init failure\n");
-        return 1;
-    }
-
-    // Initialize a completion and a watcher. A completion is the actual
-    // thing a loop does for us, and a watcher is a high-level structure
-    // to help make it easier to use completions.
-    xev_completion c;
-    xev_watcher w;
-
-    // In this case, we initialize a timer watcher.
-    if (xev_timer_init(&w) != 0) {
-        printf("xev_timer_init failure\n");
-        return 1;
-    }
-
-    // Configure the timer to run in 5s. This requires the completion that
-    // we actually configure to become a timer, and the loop that the
-    // completion should be registered with.
-    xev_timer_run(&w, &loop, &c, 5000, NULL, &timerCallback);
-
-    // Run the loop until there are no more completions.
-    xev_loop_run(&loop, XEV_RUN_UNTIL_DONE);
-
-    xev_timer_deinit(&w);
-    xev_loop_deinit(&loop);
-    return 0;
-}
-```
-
 # EXAMPLE (ZIG)
 
 The example below shows how the Zig API can be used to initialize an event
@@ -291,7 +235,7 @@ pub fn main() !void {
     // Initialize the loop state. Notice we can use a stack-allocated
     // value here. We can even pass around the loop by value! The loop
     // will contain all of our "completions" (watches).
-    var loop = try xev.Loop.init(.{ .entries = 128 });
+    var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
     // Initialize a completion and a watcher. A completion is the actual
@@ -328,7 +272,7 @@ fn timerCallback(
 
 # SEE ALSO
 
-xev-c(7), xev-zig(7)
+xev-zig(7)
 
 <https://github.com/mitchellh/libxev>
 

@@ -10,25 +10,15 @@ pub fn Async(comptime xev: type) type {
     if (xev.dynamic) return AsyncDynamic(xev);
 
     return switch (xev.backend) {
-        // Supported, uses eventfd
-        .io_uring,
-        .epoll,
-        => AsyncEventFd(xev),
+        // Linux uses eventfd
+        .io_uring => AsyncEventFd(xev),
 
-        // Supported, uses the backend API
-        .wasi_poll => AsyncLoopState(xev, xev.Loop.threaded),
-
-        // Supported, uses mach port on Darwin and eventfd on BSD.
-        .kqueue => if (comptime builtin.target.os.tag.isDarwin())
-            AsyncMachPort(xev)
-        else
-            AsyncEventFd(xev),
-
-        .iocp => AsyncIOCP(xev),
+        // macOS uses mach ports
+        .kqueue => AsyncMachPort(xev),
     };
 }
 
-/// Async implementation using eventfd (Unix/Linux).
+/// Async implementation using eventfd (Linux).
 fn AsyncEventFd(comptime xev: type) type {
     return struct {
         const Self = @This();
@@ -39,30 +29,14 @@ fn AsyncEventFd(comptime xev: type) type {
         /// eventfd file descriptor
         fd: posix.fd_t,
 
-        /// This is only used for FreeBSD currently.
-        extern "c" fn eventfd(initval: c_uint, flags: c_uint) c_int;
-
         /// Create a new async. An async can be assigned to exactly one loop
         /// to be woken up. The completion must be allocated in advance.
         pub fn init() !Self {
             return .{
-                .fd = switch (builtin.os.tag) {
-                    // std.posix is unavailable on FreeBSD. We call the
-                    // syscall directly.
-                    //
-                    // TODO: error handling
-                    .freebsd => eventfd(
-                        0,
-                        0x100000 | 0x4, // EFD_CLOEXEC | EFD_NONBLOCK
-                    ),
-
-                    // Use std.posix if we can.
-                    else => try std.posix.eventfd(
-                        0,
-                        std.os.linux.EFD.CLOEXEC |
-                            std.os.linux.EFD.NONBLOCK,
-                    ),
-                },
+                .fd = try std.posix.eventfd(
+                    0,
+                    std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
+                ),
             };
         }
 
@@ -83,9 +57,8 @@ fn AsyncEventFd(comptime xev: type) type {
         /// is fine -- but unnecessary). The behavior when waiting on multiple
         /// loops is undefined.
         pub const wait = switch (xev.backend) {
-            .io_uring, .epoll => waitPoll,
+            .io_uring => waitPoll,
             .kqueue => waitRead,
-            .iocp, .wasi_poll => @compileError("AsyncEventFd does not support wait for this backend"),
         };
 
         fn waitRead(
@@ -440,176 +413,6 @@ fn AsyncMachPort(comptime xev: type) type {
     };
 }
 
-/// Async implementation that is deferred to the backend implementation
-/// loop state. This is kind of a hacky implementation and not recommended
-/// but its the only way currently to get asyncs to work on WASI.
-fn AsyncLoopState(comptime xev: type, comptime threaded: bool) type {
-    // TODO: we don't support threaded loop state async. We _can_ it just
-    // isn't done yet. To support it we need to have some sort of mutex
-    // to guard waiter below.
-    if (threaded) return struct {};
-
-    return struct {
-        const Self = @This();
-
-        wakeup: bool = false,
-        waiter: ?struct {
-            loop: *xev.Loop,
-            c: *xev.Completion,
-        } = null,
-
-        /// The error that can come in the wait callback.
-        pub const WaitError = xev.Sys.AsyncError;
-
-        pub fn init() !Self {
-            return .{};
-        }
-
-        pub fn deinit(self: *Self) void {
-            _ = self;
-        }
-
-        pub fn wait(
-            self: *Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                r: WaitError!void,
-            ) xev.CallbackAction,
-        ) void {
-            c.* = .{
-                .op = .{
-                    .async_wait = .{},
-                },
-                .userdata = userdata,
-                .callback = (struct {
-                    fn callback(
-                        ud: ?*anyopaque,
-                        l_inner: *xev.Loop,
-                        c_inner: *xev.Completion,
-                        r: xev.Result,
-                    ) xev.CallbackAction {
-                        return @call(.always_inline, cb, .{
-                            common.userdataValue(Userdata, ud),
-                            l_inner,
-                            c_inner,
-                            if (r.async_wait) |_| {} else |err| err,
-                        });
-                    }
-                }).callback,
-            };
-            loop.add(c);
-
-            self.waiter = .{
-                .loop = loop,
-                .c = c,
-            };
-
-            if (self.wakeup) self.notify() catch {};
-        }
-
-        pub fn notify(self: *Self) !void {
-            if (self.waiter) |w|
-                w.loop.async_notify(w.c)
-            else
-                self.wakeup = true;
-        }
-
-        test {
-            _ = AsyncTests(xev, Self);
-        }
-    };
-}
-
-/// Async implementation for IOCP.
-fn AsyncIOCP(comptime xev: type) type {
-    return struct {
-        const Self = @This();
-        const windows = std.os.windows;
-
-        pub const WaitError = xev.Sys.AsyncError;
-
-        guard: std.Thread.Mutex = .{},
-        wakeup: bool = false,
-        waiter: ?struct {
-            loop: *xev.Loop,
-            c: *xev.Completion,
-        } = null,
-
-        pub fn init() !Self {
-            return Self{};
-        }
-
-        pub fn deinit(self: *Self) void {
-            _ = self;
-        }
-
-        pub fn wait(
-            self: *Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                r: WaitError!void,
-            ) xev.CallbackAction,
-        ) void {
-            c.* = .{
-                .op = .{ .async_wait = .{} },
-                .userdata = userdata,
-                .callback = (struct {
-                    fn callback(
-                        ud: ?*anyopaque,
-                        l_inner: *xev.Loop,
-                        c_inner: *xev.Completion,
-                        r: xev.Result,
-                    ) xev.CallbackAction {
-                        return @call(.always_inline, cb, .{
-                            common.userdataValue(Userdata, ud),
-                            l_inner,
-                            c_inner,
-                            if (r.async_wait) |_| {} else |err| err,
-                        });
-                    }
-                }).callback,
-            };
-            loop.add(c);
-
-            self.guard.lock();
-            defer self.guard.unlock();
-
-            self.waiter = .{
-                .loop = loop,
-                .c = c,
-            };
-
-            if (self.wakeup) loop.async_notify(c);
-        }
-
-        pub fn notify(self: *Self) !void {
-            self.guard.lock();
-            defer self.guard.unlock();
-
-            if (self.waiter) |w| {
-                w.loop.async_notify(w.c);
-            } else {
-                self.wakeup = true;
-            }
-        }
-
-        test {
-            _ = AsyncTests(xev, Self);
-        }
-    };
-}
 
 fn AsyncDynamic(comptime xev: type) type {
     return struct {

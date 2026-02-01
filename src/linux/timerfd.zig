@@ -25,8 +25,9 @@ pub const Timerfd = struct {
         };
     }
 
-    pub fn deinit(self: *const Timerfd) void {
+    pub fn deinit(self: *Timerfd) void {
         posix.close(self.fd);
+        self.* = undefined;
     }
 
     /// timerfd_settime

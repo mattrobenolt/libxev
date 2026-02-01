@@ -26,10 +26,9 @@ A completion represents a single operation and can be used to determine
 if a corresponding watcher is active if the complation was used with
 the watcher.
 
-Completion state can be checked using the `c.state()` function (Zig) or
-the xev_completion_state(3) function (C). This will return an enum value
-of "dead" or "alive". More enum values may be added in the future if
-it is determined that finer grained state is useful.
+Completion state can be checked using the `c.state()` function (Zig).
+This will return an enum value of "dead" or "alive". More enum values may
+be added in the future if it is determined that finer grained state is useful.
 
 # SUGGEST A TOPIC
 

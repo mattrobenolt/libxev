@@ -22,7 +22,7 @@ pub const Options = struct {
     /// fail. Unless you're trying to really optimize for space, it is
     /// recommended you provide a thread pool.
     ///
-    /// Backends: epoll, kqueue
+    /// Backends: kqueue
     thread_pool: ?*xev.ThreadPool = null,
 };
 

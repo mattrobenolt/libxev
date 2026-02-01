@@ -12,10 +12,9 @@ specific overview of the Zig API for libxev.
 libxev is written in Zig and exports a native Zig API. The Zig API
 takes advantage of first-class Zig concepts such as comptime parameters,
 error sets, etc. in order to provide an idiomatic Zig experience. Beyond
-basic idioms, these Zig features usually result in improved performance
-over the C API. For example, all callbacks in the Zig API must be available
-at comptime because the callback call is always inlined -- this results in
-a noticable performance improvement over equivalent C consumption of libxev.
+basic idioms, these Zig features result in improved performance. For
+example, all callbacks in the Zig API must be available at comptime
+because the callback call is always inlined.
 
 The primary Zig API is visible in `src/main.zig` in the libxev source. 
 

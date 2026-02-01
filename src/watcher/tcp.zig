@@ -22,7 +22,7 @@ pub fn TCP(comptime xev: type) type {
 fn TCPStream(comptime xev: type) type {
     return struct {
         const Self = @This();
-        const FdType = if (xev.backend == .iocp) std.os.windows.HANDLE else posix.socket_t;
+        const FdType = posix.socket_t;
 
         fd: FdType,
 
@@ -43,11 +43,7 @@ fn TCPStream(comptime xev: type) type {
         /// the family is used, the actual address has no impact on the created
         /// resource.
         pub fn init(addr: std.net.Address) !Self {
-            if (xev.backend == .wasi_poll) @compileError("unsupported in WASI");
-
-            const fd = if (xev.backend == .iocp)
-                try std.os.windows.WSASocketW(addr.any.family, posix.SOCK.STREAM, 0, null, 0, std.os.windows.ws2_32.WSA_FLAG_OVERLAPPED)
-            else fd: {
+            const fd = fd: {
                 // On io_uring we don't use non-blocking sockets because we may
                 // just get EAGAIN over and over from completions.
                 const flags = flags: {
@@ -72,22 +68,14 @@ fn TCPStream(comptime xev: type) type {
 
         /// Bind the address to the socket.
         pub fn bind(self: Self, addr: std.net.Address) !void {
-            if (xev.backend == .wasi_poll) @compileError("unsupported in WASI");
-
-            const fd = if (xev.backend == .iocp) @as(std.os.windows.ws2_32.SOCKET, @ptrCast(self.fd)) else self.fd;
-
-            try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-            try posix.bind(fd, &addr.any, addr.getOsSockLen());
+            try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+            try posix.bind(self.fd, &addr.any, addr.getOsSockLen());
         }
 
         /// Listen for connections on the socket. This puts the socket into passive
         /// listening mode. Connections must still be accepted one at a time.
         pub fn listen(self: Self, backlog: u31) !void {
-            if (xev.backend == .wasi_poll) @compileError("unsupported in WASI");
-
-            const fd = if (xev.backend == .iocp) @as(std.os.windows.ws2_32.SOCKET, @ptrCast(self.fd)) else self.fd;
-
-            try posix.listen(fd, backlog);
+            try posix.listen(self.fd, backlog);
         }
 
         /// Accept a single connection.
@@ -131,13 +119,7 @@ fn TCPStream(comptime xev: type) type {
 
             // If we're dup-ing, then we ask the backend to manage the fd.
             switch (xev.backend) {
-                .io_uring,
-                .kqueue,
-                .wasi_poll,
-                .iocp,
-                => {},
-
-                .epoll => c.flags.dup = true,
+                .io_uring, .kqueue => {},
             }
 
             loop.add(c);
@@ -159,8 +141,6 @@ fn TCPStream(comptime xev: type) type {
                 r: xev.ConnectError!void,
             ) xev.CallbackAction,
         ) void {
-            if (xev.backend == .wasi_poll) @compileError("unsupported in WASI");
-
             c.* = .{
                 .op = .{
                     .connect = .{
@@ -246,10 +226,7 @@ fn TCPStream(comptime xev: type) type {
 fn TCPDynamic(comptime xev: type) type {
     return struct {
         const Self = @This();
-        const FdType = if (builtin.os.tag == .windows)
-            std.os.windows.HANDLE
-        else
-            posix.socket_t;
+        const FdType = posix.socket_t;
 
         backend: Union,
 
@@ -516,10 +493,6 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
         }
 
         test "TCP: accept/connect/send/recv/close" {
-            // We have no way to get a socket in WASI from a WASI context.
-            if (builtin.os.tag == .wasi) return error.SkipZigTest;
-            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
-
             const testing = std.testing;
 
             var tpool = ThreadPool.init(.{});
@@ -540,8 +513,6 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             var sock_len = address.getOsSockLen();
             const fd = if (xev.dynamic)
                 server.fd()
-            else if (xev.backend == .iocp)
-                @as(std.os.windows.ws2_32.SOCKET, @ptrCast(server.fd))
             else
                 server.fd;
             try posix.getsockname(fd, &address.any, &sock_len);
@@ -695,12 +666,6 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
         // 5. Set up a receiver that loops until it receives the entire buffer
         // 6. Assert send_buf == recv_buf
         test "TCP: Queued writes" {
-            // We have no way to get a socket in WASI from a WASI context.
-            if (builtin.os.tag == .wasi) return error.SkipZigTest;
-            // Windows doesn't seem to respect the SNDBUF socket option.
-            if (builtin.os.tag == .windows) return error.SkipZigTest;
-            if (builtin.os.tag == .freebsd) return error.SkipZigTest;
-
             const testing = std.testing;
 
             var tpool = ThreadPool.init(.{});

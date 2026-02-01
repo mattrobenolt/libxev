@@ -1,5 +1,4 @@
-//! Backend to use kqueue. This is currently only tested on macOS but
-//! support for BSDs is planned (if it doesn't already work).
+//! Backend to use kqueue on macOS.
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -23,27 +22,10 @@ const log = std.log.scoped(.libxev_kqueue);
 
 /// True if this backend is available on this platform.
 pub fn available() bool {
-    return switch (builtin.os.tag) {
-        // macOS uses kqueue
-        .ios, .macos => true,
-
-        // BSDs use kqueue, but we only test on FreeBSD for now.
-        // kqueue isn't exactly the same here as it is on Apple platforms.
-        .freebsd => true,
-
-        // Technically other BSDs support kqueue but our implementation
-        // below hard requires mach ports currently. That's not a fundamental
-        // requirement but until someone makes this implementation work
-        // on other BSDs we'll just say it isn't available.
-        else => false,
-    };
+    return builtin.os.tag == .macos;
 }
 
-pub const NOTE_EXIT_FLAGS = switch (builtin.os.tag) {
-    .ios, .macos => std.c.NOTE.EXIT | std.c.NOTE.EXITSTATUS,
-    .freebsd => std.c.NOTE.EXIT,
-    else => @compileError("kqueue not supported yet for target OS"),
-};
+pub const NOTE_EXIT_FLAGS = std.c.NOTE.EXIT | std.c.NOTE.EXITSTATUS;
 
 pub const Loop = struct {
     const TimerHeap = heap.Intrusive(Timer, void, Timer.less);
@@ -52,7 +34,7 @@ pub const Loop = struct {
     /// The fd of the kqueue.
     kqueue_fd: posix.fd_t,
 
-    /// The wakeup mechanism (mach ports on Apple, eventfd on BSD).
+    /// The wakeup mechanism using mach ports.
     wakeup_state: Wakeup,
 
     /// The number of active completions. This DOES NOT include completions that
@@ -494,10 +476,8 @@ pub const Loop = struct {
                     if (timeout) |*t| t else null,
                 ) catch |err| switch (err) {
                     // This should never happen because we always have
-                    // space in our event list. If I'm reading the BSD source
-                    // right (and Apple does something similar...) then ENOENT
-                    // is always put into the eventlist if there is space:
-                    // https://github.com/freebsd/freebsd-src/blob/5a4a83fd0e67a0d7787d2f3e09ef0e5552a1ffb6/sys/kern/kern_event.c#L1668
+                    // space in our event list. ENOENT is always put into
+                    // the eventlist if there is space.
                     error.EventNotFound => unreachable,
 
                     // Any other error is fatal
@@ -1431,7 +1411,7 @@ pub const Completion = struct {
 };
 
 /// The struct used for loop wakeup. This is only internal state.
-const Wakeup = if (builtin.os.tag.isDarwin()) struct {
+const Wakeup = struct {
     const Self = @This();
 
     /// The mach port that this kqueue always has a filter for. Writing
@@ -1475,28 +1455,6 @@ const Wakeup = if (builtin.os.tag.isDarwin()) struct {
 
     fn wakeup(self: *Self) !void {
         try self.mach_port.notify();
-    }
-} else struct {
-    // TODO: We should use eventfd for FreeBSD. Until this is
-    // implemented, loop wakeup will crash on BSD.
-    const Self = @This();
-
-    fn init() !Self {
-        return .{};
-    }
-
-    fn deinit(self: *Self) void {
-        _ = self;
-    }
-
-    fn setup(self: *Self, kqueue_fd: posix.fd_t) !void {
-        _ = self;
-        _ = kqueue_fd;
-    }
-
-    fn wakeup(self: *Self) !void {
-        _ = self;
-        @panic("wakeup not implemented on this platform");
     }
 };
 
@@ -1704,7 +1662,7 @@ pub const TimerError = error{
 };
 
 pub const TimerTrigger = enum {
-    /// Unused with epoll
+    /// Unused with kqueue
     request,
 
     /// Timer expired.
@@ -1797,13 +1755,8 @@ const Timer = struct {
     }
 };
 
-/// Kevent is either kevent_s or kevent64_s depending on the target platform.
-/// This lets us support both Mac and non-Mac platforms.
-const Kevent = switch (builtin.os.tag) {
-    .ios, .macos => posix.system.kevent64_s,
-    .freebsd => std.c.Kevent,
-    else => @compileError("kqueue not supported yet for target OS"),
-};
+/// Kevent is kevent64_s on macOS.
+const Kevent = posix.system.kevent64_s;
 
 /// kevent calls either kevent or kevent64 depending on the
 /// target platform.

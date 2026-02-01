@@ -1,13 +1,15 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
-const queue = @import("../queue.zig");
+const builtin = @import("builtin");
+
 const looppkg = @import("../loop.zig");
-const Callback = looppkg.Callback(@This());
 const CallbackAction = looppkg.CallbackAction;
 const CompletionState = looppkg.CompletionState;
+const queue = @import("../queue.zig");
+
+const Callback = looppkg.Callback(@This());
 const noopCallback = looppkg.NoopCallback(@This());
 
 /// True if this backend is available on this platform.
@@ -629,7 +631,7 @@ pub const Completion = struct {
         /// completion is not part of any loop
         dead = 0,
 
-        /// completion is registered with epoll
+        /// completion is registered with the loop
         active = 1,
     };
 

@@ -176,11 +176,7 @@ fn TimerLoop(comptime xev: type) type {
                     }).callback,
                 },
 
-                .epoll,
-                .kqueue,
-                .wasi_poll,
-                .iocp,
-                => .{
+                .kqueue => .{
                     .op = .{
                         .cancel = .{
                             .c = c_timer,

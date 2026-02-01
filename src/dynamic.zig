@@ -8,9 +8,7 @@ const looppkg = @import("loop.zig");
 
 /// Creates the Xev API based on a set of backend types that allows
 /// for dynamic choice between the various candidate backends (assuming
-/// they're available). For example, on Linux, this allows a consumer to
-/// choose between io_uring and epoll, or for automatic fallback to epoll
-/// to occur.
+/// they're available).
 ///
 /// If only one backend is given, the returned type is equivalent to
 /// the static API with no runtime conditional logic, so there is no downside
@@ -447,7 +445,7 @@ fn EnumSubset(comptime T: type, comptime values: []const T) type {
 ///
 ///   union {
 ///     io_uring: IO_Uring.Async,
-///     epoll: Epoll.Async,
+///     kqueue: Kqueue.Async,
 ///     ...
 ///   }
 ///
