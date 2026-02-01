@@ -15,6 +15,11 @@ pub const Options = struct {
     /// Backends: io_uring
     entries: u32 = 256,
 
+    /// io_uring setup flags. These are passed directly to io_uring_setup().
+    ///
+    /// Backends: io_uring
+    io_uring_flags: IoUringSetupFlags = .{},
+
     /// A thread pool to use for blocking operations. If the backend doesn't
     /// need to perform any blocking operations then no threads will ever
     /// be spawned. If the backend does need to perform blocking operations
@@ -24,6 +29,93 @@ pub const Options = struct {
     ///
     /// Backends: kqueue
     thread_pool: ?*xev.ThreadPool = null,
+};
+
+/// io_uring setup flags for configuring the ring behavior.
+/// These correspond to IORING_SETUP_* flags passed to io_uring_setup().
+pub const IoUringSetupFlags = packed struct(u32) {
+    /// Perform busy-waiting for I/O completion instead of getting
+    /// notifications via an async IRQ. Requires elevated privileges.
+    iopoll: bool = false,
+
+    /// Use a kernel thread to poll the submission queue. This enables
+    /// truly async I/O by allowing submissions without system calls
+    /// when the kernel thread is active.
+    sqpoll: bool = false,
+
+    /// Bind the kernel's poll thread to the CPU specified in sq_thread_cpu.
+    /// Only valid when sqpoll is set.
+    sq_aff: bool = false,
+
+    /// Create the completion queue with the size specified in cq_entries.
+    /// The value must be >= entries and may be rounded up to a power of two.
+    cqsize: bool = false,
+
+    /// Clamp entries and cq_entries to implementation-defined maximums
+    /// instead of returning EINVAL.
+    clamp: bool = false,
+
+    /// Share the async backend of an existing ring. The fd of the
+    /// existing ring is passed in wq_fd.
+    attach_wq: bool = false,
+
+    /// Start the ring in a disabled state. The ring must be enabled
+    /// via io_uring_register() before submissions are allowed.
+    r_disabled: bool = false,
+
+    /// Continue submitting requests even if an error is encountered
+    /// during submission. Without this, submission stops at the first error.
+    submit_all: bool = false,
+
+    /// Cooperative task running. When set, io_uring will not interrupt
+    /// a task when async completions are ready; the task must explicitly
+    /// check for completions. Can reduce context switches.
+    coop_taskrun: bool = false,
+
+    /// Used with coop_taskrun - always set the task running flag when
+    /// completions are ready, even if they can be processed inline.
+    taskrun_flag: bool = false,
+
+    /// Use 128-byte SQEs instead of the default 64-byte SQEs. Allows
+    /// larger inline data for certain operations.
+    sqe128: bool = false,
+
+    /// Use 32-byte CQEs instead of the default 16-byte CQEs. Provides
+    /// more space for completion data.
+    cqe32: bool = false,
+
+    /// Hint that only a single task will submit requests. Enables
+    /// internal optimizations.
+    single_issuer: bool = false,
+
+    /// Defer running task work to when the task transitions to userspace.
+    /// Must be used with single_issuer. Reduces kernel overhead for
+    /// batched submissions.
+    defer_taskrun: bool = false,
+
+    /// Don't mmap the rings into userspace. The application must use
+    /// registered ring fds. For advanced use cases.
+    no_mmap: bool = false,
+
+    /// Only allow registered file descriptors. All file descriptors
+    /// must be registered before use.
+    registered_fd_only: bool = false,
+
+    /// Don't allocate an SQ array. The application indexes directly
+    /// into the SQE array.
+    no_sqarray: bool = false,
+
+    _padding: u15 = 0,
+
+    /// Convert to the raw u32 flags value for passing to the kernel.
+    pub fn toInt(self: IoUringSetupFlags) u32 {
+        return @bitCast(self);
+    }
+
+    /// Create from a raw u32 flags value.
+    pub fn fromInt(value: u32) IoUringSetupFlags {
+        return @bitCast(value);
+    }
 };
 
 /// The loop run mode -- all backends are required to support this in some way.
@@ -101,3 +193,37 @@ pub const CompletionState = enum(c_int) {
     /// on or in the process of being registered.
     active = 1,
 };
+
+const testing = @import("std").testing;
+const linux = @import("std").os.linux;
+
+test "IoUringSetupFlags bit layout" {
+    // Verify the flags match the kernel constants
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_IOPOLL), (IoUringSetupFlags{ .iopoll = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_SQPOLL), (IoUringSetupFlags{ .sqpoll = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_SQ_AFF), (IoUringSetupFlags{ .sq_aff = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_CQSIZE), (IoUringSetupFlags{ .cqsize = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_CLAMP), (IoUringSetupFlags{ .clamp = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_ATTACH_WQ), (IoUringSetupFlags{ .attach_wq = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_R_DISABLED), (IoUringSetupFlags{ .r_disabled = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_SUBMIT_ALL), (IoUringSetupFlags{ .submit_all = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_COOP_TASKRUN), (IoUringSetupFlags{ .coop_taskrun = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_TASKRUN_FLAG), (IoUringSetupFlags{ .taskrun_flag = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_SQE128), (IoUringSetupFlags{ .sqe128 = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_CQE32), (IoUringSetupFlags{ .cqe32 = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_SINGLE_ISSUER), (IoUringSetupFlags{ .single_issuer = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_DEFER_TASKRUN), (IoUringSetupFlags{ .defer_taskrun = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_NO_MMAP), (IoUringSetupFlags{ .no_mmap = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_REGISTERED_FD_ONLY), (IoUringSetupFlags{ .registered_fd_only = true }).toInt());
+    try testing.expectEqual(@as(u32, linux.IORING_SETUP_NO_SQARRAY), (IoUringSetupFlags{ .no_sqarray = true }).toInt());
+
+    // Test combining multiple flags
+    const combined = IoUringSetupFlags{
+        .single_issuer = true,
+        .coop_taskrun = true,
+    };
+    try testing.expectEqual(
+        linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN,
+        combined.toInt(),
+    );
+}

@@ -64,10 +64,7 @@ pub const Loop = struct {
             return error.TooManyEntries;
 
         var result: Loop = .{
-            // TODO(mitchellh): add an init_advanced function or something
-            // for people using the io_uring API directly to be able to set
-            // the flags for this.
-            .ring = try linux.IoUring.init(entries, 0),
+            .ring = try linux.IoUring.init(entries, options.io_uring_flags.toInt()),
         };
         result.update_now();
 
@@ -190,11 +187,18 @@ pub const Loop = struct {
 
             for (cqes[0..count]) |cqe| {
                 const c = @as(?*Completion, @ptrFromInt(@as(usize, @intCast(cqe.user_data)))) orelse continue;
-                self.active -= 1;
-                c.flags.state = .dead;
+
+                // For multishot operations, IORING_CQE_F_MORE indicates more
+                // completions will follow. Don't mark as dead or decrement active.
+                const more = cqe.flags & linux.IORING_CQE_F_MORE != 0;
+                if (!more) {
+                    self.active -= 1;
+                    c.flags.state = .dead;
+                }
+
                 switch (c.invoke(self, cqe.res)) {
                     .disarm => {},
-                    .rearm => self.add(c),
+                    .rearm => if (!more) self.add(c),
                 }
             }
 
@@ -399,12 +403,15 @@ pub const Loop = struct {
                 return;
             },
 
-            .accept => |*v| sqe.prep_accept(
-                v.socket,
-                &v.addr,
-                &v.addr_size,
-                v.flags,
-            ),
+            .accept => |*v| {
+                sqe.prep_accept(
+                    v.socket,
+                    &v.addr,
+                    &v.addr_size,
+                    v.flags,
+                );
+                if (v.multishot) sqe.ioprio |= linux.IORING_ACCEPT_MULTISHOT;
+            },
 
             .close => |v| sqe.prep_close(v.fd),
 
@@ -414,7 +421,10 @@ pub const Loop = struct {
                 v.addr.getOsSockLen(),
             ),
 
-            .poll => |v| sqe.prep_poll_add(v.fd, v.events),
+            .poll => |v| {
+                sqe.prep_poll_add(v.fd, v.events);
+                if (v.multishot) sqe.len = linux.IORING_POLL_ADD_MULTI;
+            },
 
             .read => |*v| switch (v.buffer) {
                 .array => |*buf| sqe.prep_read(
@@ -450,18 +460,21 @@ pub const Loop = struct {
                 ),
             },
 
-            .recv => |*v| switch (v.buffer) {
-                .array => |*buf| sqe.prep_recv(
-                    v.fd,
-                    buf,
-                    0,
-                ),
+            .recv => |*v| {
+                switch (v.buffer) {
+                    .array => |*buf| sqe.prep_recv(
+                        v.fd,
+                        buf,
+                        0,
+                    ),
 
-                .slice => |buf| sqe.prep_recv(
-                    v.fd,
-                    buf,
-                    0,
-                ),
+                    .slice => |buf| sqe.prep_recv(
+                        v.fd,
+                        buf,
+                        0,
+                    ),
+                }
+                if (v.multishot) sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
             },
 
             .recvmsg => |*v| {
@@ -923,6 +936,10 @@ pub const Operation = union(OperationType) {
         addr: posix.sockaddr = undefined,
         addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
         flags: u32 = posix.SOCK.CLOEXEC,
+        /// Enable multishot mode. When enabled, the completion will fire
+        /// for each incoming connection without needing to be rearmed.
+        /// Requires kernel 5.19+.
+        multishot: bool = false,
     },
 
     close: struct {
@@ -937,6 +954,11 @@ pub const Operation = union(OperationType) {
     poll: struct {
         fd: posix.fd_t,
         events: u32 = posix.POLL.IN,
+        /// Enable multishot mode. When enabled, the completion will fire
+        /// multiple times without needing to be rearmed. The callback should
+        /// return .disarm when it no longer wants to receive events.
+        /// Requires kernel 5.13+.
+        multishot: bool = false,
     },
 
     read: struct {
@@ -953,6 +975,11 @@ pub const Operation = union(OperationType) {
     recv: struct {
         fd: posix.fd_t,
         buffer: ReadBuffer,
+        /// Enable multishot mode. When enabled, the completion will fire
+        /// multiple times as data arrives without needing to be rearmed.
+        /// Note: Multishot recv works best with provided buffer pools.
+        /// Requires kernel 6.0+.
+        multishot: bool = false,
     },
 
     send: struct {
@@ -1788,4 +1815,130 @@ test "io_uring: socket read cancellation" {
     try loop.run(.until_done);
     try testing.expectEqual(OperationType.read, @as(OperationType, read_result));
     try testing.expectError(error.Canceled, read_result.read);
+}
+
+test "io_uring: multishot accept" {
+    const net = std.net;
+    const os = posix;
+    const testing = std.testing;
+    const mem = std.mem;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    // Create a TCP server socket
+    const address = try net.Address.parseIp4("127.0.0.1", 3139);
+    const ln = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
+    defer os.close(ln);
+    try os.setsockopt(ln, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
+    try os.bind(ln, &address.any, address.getOsSockLen());
+    try os.listen(ln, 8);
+
+    // Track accepted connections
+    const State = struct {
+        accept_count: usize = 0,
+        connections: [3]os.socket_t = .{ 0, 0, 0 },
+    };
+    var state = State{};
+
+    // Multishot accept completion
+    var c_accept: Completion = .{
+        .op = .{
+            .accept = .{
+                .socket = ln,
+                .multishot = true,
+            },
+        },
+        .userdata = &state,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, l: *Loop, c: *Completion, r: Result) CallbackAction {
+                _ = l;
+                _ = c;
+                const s = @as(*State, @ptrCast(@alignCast(ud.?)));
+                const conn = r.accept catch unreachable;
+                if (s.accept_count < 3) {
+                    s.connections[s.accept_count] = conn;
+                }
+                s.accept_count += 1;
+                // Stop after 3 accepts
+                return if (s.accept_count >= 3) .disarm else .rearm;
+            }
+        }).callback,
+    };
+    loop.add(&c_accept);
+
+    // Create 3 client connections
+    var clients: [3]os.socket_t = undefined;
+    for (&clients) |*client| {
+        client.* = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC | os.SOCK.NONBLOCK, 0);
+        os.connect(client.*, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+            error.WouldBlock => {},
+            else => return err,
+        };
+    }
+    defer for (clients) |client| os.close(client);
+
+    // Run until all accepts complete
+    try loop.run(.until_done);
+
+    // Verify we got 3 connections from a single multishot accept
+    try testing.expectEqual(@as(usize, 3), state.accept_count);
+    for (state.connections) |conn| {
+        try testing.expect(conn > 0);
+        os.close(conn);
+    }
+}
+
+test "io_uring: multishot poll" {
+    const os = posix;
+    const testing = std.testing;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    // Create a pipe for testing poll
+    const pipe = try os.pipe2(.{ .NONBLOCK = true });
+    defer os.close(pipe[0]);
+    defer os.close(pipe[1]);
+
+    const State = struct {
+        poll_count: usize = 0,
+    };
+    var state = State{};
+
+    // Multishot poll completion
+    var c_poll: Completion = .{
+        .op = .{
+            .poll = .{
+                .fd = pipe[0],
+                .events = os.POLL.IN,
+                .multishot = true,
+            },
+        },
+        .userdata = &state,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, l: *Loop, c: *Completion, r: Result) CallbackAction {
+                _ = l;
+                _ = c;
+                _ = r.poll catch unreachable;
+                const s = @as(*State, @ptrCast(@alignCast(ud.?)));
+                s.poll_count += 1;
+                // Stop after 3 polls
+                return if (s.poll_count >= 3) .disarm else .rearm;
+            }
+        }).callback,
+    };
+    loop.add(&c_poll);
+
+    // Write data multiple times to trigger poll events
+    for (0..3) |_| {
+        _ = try os.write(pipe[1], "x");
+        try loop.run(.once);
+        // Read to reset the poll state
+        var buf: [1]u8 = undefined;
+        _ = os.read(pipe[0], &buf) catch {};
+    }
+
+    // Verify poll fired multiple times
+    try testing.expectEqual(@as(usize, 3), state.poll_count);
 }

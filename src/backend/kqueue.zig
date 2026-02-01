@@ -1490,6 +1490,9 @@ pub const Operation = union(OperationType) {
         addr: posix.sockaddr = undefined,
         addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
         flags: u32 = posix.SOCK.CLOEXEC,
+        /// Multishot mode (io_uring only). On kqueue, this is ignored and
+        /// the callback must return .rearm to accept additional connections.
+        multishot: bool = false,
     },
 
     connect: struct {
@@ -1527,6 +1530,9 @@ pub const Operation = union(OperationType) {
     recv: struct {
         fd: posix.fd_t,
         buffer: ReadBuffer,
+        /// Multishot mode (io_uring only). On kqueue, this is ignored and
+        /// the callback must return .rearm to receive additional data.
+        multishot: bool = false,
     },
 
     // Note: this is making our Completion quite large. We can follow
