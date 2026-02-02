@@ -569,7 +569,8 @@ pub const Loop = struct {
 
             .recv_pool => |*v| {
                 // Use recv with null buffer - kernel will select from buffer group
-                sqe.prep_recv(v.fd, @as([*]u8, undefined)[0..0], 0);
+                // Must use prep_rw directly to set buffer addr to 0 (not prep_recv which would deref)
+                sqe.prep_rw(.RECV, v.fd, 0, 0, 0);
                 sqe.flags |= linux.IOSQE_BUFFER_SELECT;
                 sqe.buf_index = v.buffer_group_id;
                 if (v.multishot) sqe.ioprio |= linux.IORING_RECV_MULTISHOT;

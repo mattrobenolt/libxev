@@ -261,8 +261,7 @@ fn TCPStream(comptime xev: type) type {
                                 const user_result: xev.RecvPoolError!xev.BufferPool.Recv = blk: {
                                     const bytes_read = res.result catch |err| break :blk err;
                                     const buffer_id = res.buffer_id orelse break :blk error.NoBuffersAvailable;
-                                    // Return the buffer back to the ring for reuse after processing
-                                    pool_ptr.impl.putBuffer(buffer_id, pool_ptr.config.size);
+                                    // Don't return buffer to kernel here - user will call release() when done
                                     break :blk pool_ptr.getRecvFromResult(buffer_id, bytes_read);
                                 };
 
