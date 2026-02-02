@@ -1,14 +1,12 @@
 /// "Wake up" an event loop from any thread using an async completion.
 const std = @import("std");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
-const common = @import("common.zig");
+
 const darwin = @import("../darwin.zig");
+const common = @import("common.zig");
 
 pub fn Async(comptime xev: type) type {
-    if (xev.dynamic) return AsyncDynamic(xev);
-
     return switch (xev.backend) {
         // Linux uses eventfd
         .io_uring => AsyncEventFd(xev),
@@ -412,108 +410,6 @@ fn AsyncMachPort(comptime xev: type) type {
         }
     };
 }
-
-
-fn AsyncDynamic(comptime xev: type) type {
-    return struct {
-        const Self = @This();
-
-        backend: Union,
-
-        pub const Union = xev.Union(&.{"Async"});
-        pub const WaitError = xev.ErrorSet(&.{ "Async", "WaitError" });
-
-        pub fn init() !Self {
-            return .{ .backend = switch (xev.backend) {
-                inline else => |tag| backend: {
-                    const api = (comptime xev.superset(tag)).Api();
-                    break :backend @unionInit(
-                        Union,
-                        @tagName(tag),
-                        try api.Async.init(),
-                    );
-                },
-            } };
-        }
-
-        pub fn deinit(self: *Self) void {
-            switch (xev.backend) {
-                inline else => |tag| @field(
-                    self.backend,
-                    @tagName(tag),
-                ).deinit(),
-            }
-        }
-
-        pub fn notify(self: *Self) !void {
-            switch (xev.backend) {
-                inline else => |tag| try @field(
-                    self.backend,
-                    @tagName(tag),
-                ).notify(),
-            }
-        }
-
-        pub fn wait(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                r: WaitError!void,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    c.ensureTag(tag);
-
-                    const api = (comptime xev.superset(tag)).Api();
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            r_inner: api.Async.WaitError!void,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).wait(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-
-        test {
-            _ = AsyncTests(xev, Self);
-        }
-    };
-}
-
 fn AsyncTests(comptime xev: type, comptime Impl: type) type {
     return struct {
         test "async" {

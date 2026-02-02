@@ -1,10 +1,10 @@
-const std = @import("std");
+const Io = @import("std").Io;
 
-inline fn indent(depth: usize, writer: anytype) !void {
+inline fn indent(depth: usize, writer: *Io.Writer) !void {
     for (0..depth) |_| try writer.writeByte(' ');
 }
 
-pub fn describe(comptime T: type, writer: anytype, depth: usize) !void {
+pub fn describe(comptime T: type, writer: *Io.Writer, depth: usize) !void {
     const type_info = @typeInfo(T);
     switch (type_info) {
         .Type,

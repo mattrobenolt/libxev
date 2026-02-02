@@ -1,6 +1,5 @@
-const builtin = @import("builtin");
-const stream = @import("watcher/stream.zig");
 const Backend = @import("backend.zig").Backend;
+const stream = @import("watcher/stream.zig");
 
 /// Creates the Xev API based on a backend type.
 ///
@@ -15,9 +14,6 @@ pub fn Xev(comptime be: Backend, comptime T: type) type {
     return struct {
         const Self = @This();
         const loop = @import("loop.zig");
-
-        /// This is used to detect a static vs dynamic API at comptime.
-        pub const dynamic = false;
 
         /// The backend that this is. This is supplied at comptime so
         /// it is up to the caller to say the right thing. This lets custom

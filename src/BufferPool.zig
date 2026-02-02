@@ -1,7 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 

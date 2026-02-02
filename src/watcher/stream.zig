@@ -111,97 +111,13 @@ pub fn Stream(comptime xev: type, comptime T: type, comptime options: Options) t
         pub const read = if (R_) |R| R.read else {};
 
         const W_: ?type = if (options.write != .none) Writeable(xev, T, options) else null;
-        pub const writeInit = if (W_) |W| writeInit: {
-            if (xev.dynamic) break :writeInit {};
-            break :writeInit W.writeInit;
-        } else {};
+        pub const writeInit = if (W_) |W| W.writeInit else {};
         pub const write = if (W_) |W| W.write else null;
         pub const queueWrite = if (W_) |W| W.queueWrite else {};
     };
 }
 
 fn Pollable(comptime xev: type, comptime T: type, comptime options: Options) type {
-    if (xev.dynamic) {
-        // If all candidate backends do not support poll, our dynamic
-        // type cannot support poll.
-        comptime {
-            for (xev.candidates) |be| {
-                const CandidateT = @field(be.Api(), options.type.?);
-                const info = @typeInfo(CandidateT).@"struct";
-                for (info.decls) |decl| {
-                    if (std.mem.eql(u8, decl.name, "poll")) break;
-                } else return struct {};
-            }
-        }
-
-        return struct {
-            const Self = T;
-
-            pub fn poll(
-                self: Self,
-                loop: *xev.Loop,
-                c: *xev.Completion,
-                event: xev.PollEvent,
-                comptime Userdata: type,
-                userdata: ?*Userdata,
-                comptime cb: *const fn (
-                    ud: ?*Userdata,
-                    l: *xev.Loop,
-                    c: *xev.Completion,
-                    s: Self,
-                    r: xev.PollError!xev.PollEvent,
-                ) xev.CallbackAction,
-            ) void {
-                switch (xev.backend) {
-                    inline else => |tag| {
-                        c.ensureTag(tag);
-
-                        const api = (comptime xev.superset(tag)).Api();
-                        const BackendSelf = @field(api, options.type.?);
-                        const api_cb = (struct {
-                            fn callback(
-                                ud_inner: ?*Userdata,
-                                l_inner: *api.Loop,
-                                c_inner: *api.Completion,
-                                s_inner: BackendSelf,
-                                r_inner: api.PollError!api.PollEvent,
-                            ) xev.CallbackAction {
-                                return cb(
-                                    ud_inner,
-                                    @fieldParentPtr("backend", @as(
-                                        *xev.Loop.Union,
-                                        @fieldParentPtr(@tagName(tag), l_inner),
-                                    )),
-                                    @fieldParentPtr("value", @as(
-                                        *xev.Completion.Union,
-                                        @fieldParentPtr(@tagName(tag), c_inner),
-                                    )),
-                                    Self.initFd(s_inner.fd),
-                                    if (r_inner) |v|
-                                        xev.PollEvent.fromBackend(tag, v)
-                                    else |err|
-                                        err,
-                                );
-                            }
-                        }).callback;
-
-                        @field(
-                            self.backend,
-                            @tagName(tag),
-                        ).poll(
-                            &@field(loop.backend, @tagName(tag)),
-                            &@field(c.value, @tagName(tag)),
-                            event.toBackend(tag),
-                            Userdata,
-                            userdata,
-                            api_cb,
-                        );
-                    },
-                }
-            }
-        };
-    }
-
     // Do not add the methods for poll if the backend doesn't support it.
     switch (xev.backend) {
         .io_uring, .kqueue => {},
@@ -282,68 +198,7 @@ fn Pollable(comptime xev: type, comptime T: type, comptime options: Options) typ
 }
 
 pub fn Closeable(comptime xev: type, comptime T: type, comptime options: Options) type {
-    if (xev.dynamic) return struct {
-        const Self = T;
-
-        pub fn close(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: Self,
-                r: xev.CloseError!void,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    c.ensureTag(tag);
-
-                    const api = (comptime xev.superset(tag)).Api();
-                    const BackendSelf = @field(api, options.type.?);
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            s_inner: BackendSelf,
-                            r_inner: api.CloseError!void,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                Self.initFd(s_inner.fd),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).close(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-    };
-
+    _ = options;
     return struct {
         const Self = T;
 
@@ -399,73 +254,6 @@ pub fn Closeable(comptime xev: type, comptime T: type, comptime options: Options
 }
 
 pub fn Readable(comptime xev: type, comptime T: type, comptime options: Options) type {
-    if (xev.dynamic) return struct {
-        const Self = T;
-
-        pub fn read(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            buf: xev.ReadBuffer,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: Self,
-                b: xev.ReadBuffer,
-                r: xev.ReadError!usize,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    c.ensureTag(tag);
-
-                    const api = (comptime xev.superset(tag)).Api();
-                    const BackendSelf = @field(api, options.type.?);
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            s_inner: BackendSelf,
-                            b_inner: api.ReadBuffer,
-                            r_inner: xev.ReadError!usize,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                Self.initFd(s_inner.fd),
-                                xev.ReadBuffer.fromBackend(tag, b_inner),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).read(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        buf.toBackend(tag),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-    };
-
     return struct {
         const Self = T;
 
@@ -566,148 +354,6 @@ pub fn Readable(comptime xev: type, comptime T: type, comptime options: Options)
 }
 
 pub fn Writeable(comptime xev: type, comptime T: type, comptime options: Options) type {
-    if (xev.dynamic) return struct {
-        const Self = T;
-
-        pub fn write(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            buf: xev.WriteBuffer,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: Self,
-                b: xev.WriteBuffer,
-                r: xev.WriteError!usize,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    c.ensureTag(tag);
-
-                    const api = (comptime xev.superset(tag)).Api();
-                    const BackendSelf = @field(api, options.type.?);
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            s_inner: BackendSelf,
-                            b_inner: api.WriteBuffer,
-                            r_inner: api.WriteError!usize,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                Self.initFd(s_inner.fd),
-                                xev.WriteBuffer.fromBackend(tag, b_inner),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).write(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        buf.toBackend(tag),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-
-        pub fn queueWrite(
-            self: Self,
-            loop: *xev.Loop,
-            q: *xev.WriteQueue,
-            req: *xev.WriteRequest,
-            buf: xev.WriteBuffer,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: Self,
-                b: xev.WriteBuffer,
-                r: xev.WriteError!usize,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    const api = (comptime xev.superset(tag)).Api();
-                    const BackendSelf = @field(api, options.type.?);
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            s_inner: BackendSelf,
-                            b_inner: api.WriteBuffer,
-                            r_inner: api.WriteError!usize,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                Self.initFd(s_inner.fd),
-                                xev.WriteBuffer.fromBackend(tag, b_inner),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    // Ensure our WriteQueue has the correct tag, since it is
-                    // regularly zero-initialized and our zero-init picks
-                    // an arbitrary backend.
-                    q.ensureTag(tag);
-
-                    // Initialize our request since it is usually undefined.
-                    req.* = @unionInit(
-                        xev.WriteRequest,
-                        @tagName(tag),
-                        undefined,
-                    );
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).queueWrite(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(q.value, @tagName(tag)),
-                        &@field(req, @tagName(tag)),
-                        buf.toBackend(tag),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-    };
-
     return struct {
         const Self = T;
 
@@ -978,54 +624,6 @@ pub fn Writeable(comptime xev: type, comptime T: type, comptime options: Options
 /// behavior on read/write. This should NOT be used for local files because
 /// local files have some special properties; you should use xev.File for that.
 pub fn GenericStream(comptime xev: type) type {
-    if (xev.dynamic) return struct {
-        const Self = @This();
-
-        backend: Union,
-
-        pub const Union = xev.Union(&.{"Stream"});
-
-        const S = Stream(xev, Self, .{
-            .close = true,
-            .poll = true,
-            .read = .read,
-            .write = .write,
-            .type = "Stream",
-        });
-        pub const close = S.close;
-        pub const poll = S.poll;
-        pub const read = S.read;
-        pub const write = S.write;
-        pub const writeInit = S.writeInit;
-        pub const queueWrite = S.queueWrite;
-
-        pub fn initFd(fd: std.posix.pid_t) Self {
-            return .{ .backend = switch (xev.backend) {
-                inline else => |tag| backend: {
-                    const api = (comptime xev.superset(tag)).Api();
-                    break :backend @unionInit(
-                        Union,
-                        @tagName(tag),
-                        api.Stream.initFd(fd),
-                    );
-                },
-            } };
-        }
-
-        pub fn deinit(self: *Self) void {
-            switch (xev.backend) {
-                inline else => |tag| @field(
-                    self.backend,
-                    @tagName(tag),
-                ).deinit(),
-            }
-        }
-
-        test {
-            _ = GenericStreamTests(xev, Self);
-        }
-    };
-
     return struct {
         const Self = @This();
 
@@ -1212,10 +810,6 @@ fn GenericStreamTests(comptime xev: type, comptime Impl: type) type {
                 else => return error.SkipZigTest,
             }
 
-            // this test fails on x86_64 with a strange error but passes
-            // on aarch64. for now, just let it go until we investigate.
-            if (xev.dynamic and builtin.cpu.arch == .x86_64) return error.SkipZigTest;
-
             // Create the pty parent/child side.
             var pty = try Pty.init();
             defer pty.deinit();
@@ -1306,11 +900,9 @@ fn GenericStreamTests(comptime xev: type, comptime Impl: type) type {
             try testing.expectEqualSlices(u8, "hello, world!\n", read_buf[0..read_len.?]);
 
             // Verify our completion is equal to our request
-            if (!xev.dynamic) {
-                try testing.expect(
-                    xev.WriteRequest.from(c_result.?) == &write_req[1],
-                );
-            }
+            try testing.expect(
+                xev.WriteRequest.from(c_result.?) == &write_req[1],
+            );
         }
     };
 }

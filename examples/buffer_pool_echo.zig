@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const xev = @import("xev");
 
 /// A simple TCP echo server using BufferPool for efficient buffer management.
@@ -10,9 +11,8 @@ const xev = @import("xev");
 ///
 /// Run with: zig build && ./zig-out/bin/buffer_pool_echo
 /// Test with: echo "hello" | nc localhost 3000
-
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -41,7 +41,7 @@ pub fn main() !void {
     std.debug.print("Test with: echo 'hello' | nc localhost 3000\n", .{});
 
     // Create context for managing connections
-    var ctx = Context{
+    var ctx: Context = .{
         .allocator = allocator,
         .pool = &pool,
         .server = server,

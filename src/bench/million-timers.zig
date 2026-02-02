@@ -1,7 +1,7 @@
 const std = @import("std");
 const Instant = std.time.Instant;
+
 const xev = @import("xev");
-//const xev = @import("xev").Dynamic;
 
 pub const NUM_TIMERS: usize = 10 * 1000 * 1000;
 
@@ -10,15 +10,13 @@ pub fn main() !void {
     defer thread_pool.deinit();
     defer thread_pool.shutdown();
 
-    if (xev.dynamic) try xev.detect();
     var loop = try xev.Loop.init(.{
         .entries = std.math.pow(u13, 2, 12),
         .thread_pool = &thread_pool,
     });
     defer loop.deinit();
 
-    const GPA = std.heap.GeneralPurposeAllocator(.{});
-    var gpa: GPA = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 

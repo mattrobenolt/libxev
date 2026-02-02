@@ -146,7 +146,7 @@ fn buildBenchmarks(
         try steps.append(alloc, exe);
     }
 
-    return try steps.toOwnedSlice(alloc);
+    return steps.toOwnedSlice(alloc);
 }
 
 fn buildExamples(
@@ -200,7 +200,7 @@ fn buildExamples(
         try steps.append(alloc, exe);
     }
 
-    return try steps.toOwnedSlice(alloc);
+    return steps.toOwnedSlice(alloc);
 }
 
 fn manPages(b: *std.Build) ![]const *Step {
@@ -232,5 +232,5 @@ fn manPages(b: *std.Build) ![]const *Step {
         ).step);
     }
 
-    return try steps.toOwnedSlice(alloc);
+    return steps.toOwnedSlice(alloc);
 }

@@ -1,10 +1,10 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
-const stream = @import("stream.zig");
-const common = @import("common.zig");
+
 const ThreadPool = @import("../ThreadPool.zig");
+const common = @import("common.zig");
+const stream = @import("stream.zig");
 
 /// TCP client and server.
 ///
@@ -15,7 +15,6 @@ const ThreadPool = @import("../ThreadPool.zig");
 /// if you have specific needs or want to push for the most optimal performance,
 /// use the platform-specific Loop directly.
 pub fn TCP(comptime xev: type) type {
-    if (xev.dynamic) return TCPDynamic(xev);
     return TCPStream(xev);
 }
 
@@ -428,319 +427,6 @@ fn TCPStream(comptime xev: type) type {
     };
 }
 
-fn TCPDynamic(comptime xev: type) type {
-    return struct {
-        const Self = @This();
-        const FdType = posix.socket_t;
-
-        backend: Union,
-
-        pub const Union = xev.Union(&.{"TCP"});
-
-        const S = stream.Stream(xev, Self, .{
-            .close = true,
-            .poll = true,
-            .read = .read,
-            .write = .write,
-            .threadpool = true,
-            .type = "TCP",
-        });
-        pub const close = S.close;
-        pub const poll = S.poll;
-        pub const read = S.read;
-        pub const write = S.write;
-        pub const queueWrite = S.queueWrite;
-
-        pub fn init(addr: std.net.Address) !Self {
-            return .{ .backend = switch (xev.backend) {
-                inline else => |tag| backend: {
-                    const api = (comptime xev.superset(tag)).Api();
-                    break :backend @unionInit(
-                        Union,
-                        @tagName(tag),
-                        try api.TCP.init(addr),
-                    );
-                },
-            } };
-        }
-
-        pub fn initFd(fdvalue: std.posix.pid_t) Self {
-            return .{ .backend = switch (xev.backend) {
-                inline else => |tag| backend: {
-                    const api = (comptime xev.superset(tag)).Api();
-                    break :backend @unionInit(
-                        Union,
-                        @tagName(tag),
-                        api.TCP.initFd(fdvalue),
-                    );
-                },
-            } };
-        }
-
-        pub fn bind(self: Self, addr: std.net.Address) !void {
-            switch (xev.backend) {
-                inline else => |tag| try @field(
-                    self.backend,
-                    @tagName(tag),
-                ).bind(addr),
-            }
-        }
-
-        pub fn listen(self: Self, backlog: u31) !void {
-            switch (xev.backend) {
-                inline else => |tag| try @field(
-                    self.backend,
-                    @tagName(tag),
-                ).listen(backlog),
-            }
-        }
-
-        pub fn fd(self: Self) FdType {
-            switch (xev.backend) {
-                inline else => |tag| return @field(
-                    self.backend,
-                    @tagName(tag),
-                ).fd,
-            }
-        }
-
-        pub fn accept(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                r: xev.AcceptError!Self,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    c.ensureTag(tag);
-
-                    const api = (comptime xev.superset(tag)).Api();
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            r_inner: api.AcceptError!api.TCP,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                if (r_inner) |tcp|
-                                    initFd(tcp.fd)
-                                else |err|
-                                    err,
-                            );
-                        }
-                    }).callback;
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).accept(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-
-        /// Accept connections in multishot mode. See TCPStream.acceptMultishot for details.
-        pub fn acceptMultishot(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                r: xev.AcceptError!Self,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    c.ensureTag(tag);
-
-                    const api = (comptime xev.superset(tag)).Api();
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            r_inner: api.AcceptError!api.TCP,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                if (r_inner) |tcp|
-                                    initFd(tcp.fd)
-                                else |err|
-                                    err,
-                            );
-                        }
-                    }).callback;
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).acceptMultishot(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-
-        pub fn connect(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            addr: std.net.Address,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: Self,
-                r: xev.ConnectError!void,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    c.ensureTag(tag);
-
-                    const api = (comptime xev.superset(tag)).Api();
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            s_inner: api.TCP,
-                            r_inner: api.ConnectError!void,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                Self.initFd(s_inner.fd),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).connect(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        addr,
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-
-        pub fn shutdown(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: Self,
-                r: xev.ShutdownError!void,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    c.ensureTag(tag);
-
-                    const api = (comptime xev.superset(tag)).Api();
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            s_inner: api.TCP,
-                            r_inner: api.ShutdownError!void,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                Self.initFd(s_inner.fd),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).shutdown(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-
-        test {
-            _ = TCPTests(xev, Self);
-        }
-    };
-}
-
 fn TCPTests(comptime xev: type, comptime Impl: type) type {
     return struct {
         test "TCP: Stream decls" {
@@ -774,10 +460,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Retrieve bound port and initialize client
             var sock_len = address.getOsSockLen();
-            const fd = if (xev.dynamic)
-                server.fd()
-            else
-                server.fd;
+            const fd = server.fd;
             try posix.getsockname(fd, &address.any, &sock_len);
             const client = try Impl.init(address);
 
@@ -947,10 +630,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Retrieve bound port and initialize client
             var sock_len = address.getOsSockLen();
-            try posix.getsockname(if (xev.dynamic)
-                server.fd()
-            else
-                server.fd, &address.any, &sock_len);
+            try posix.getsockname(server.fd, &address.any, &sock_len);
             const client = try Impl.init(address);
 
             // Completions we need
@@ -1012,10 +692,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Unqueued send - Limit send buffer to 8kB, this should force partial writes.
             try posix.setsockopt(
-                if (xev.dynamic)
-                    client.fd()
-                else
-                    client.fd,
+                client.fd,
                 posix.SOL.SOCKET,
                 posix.SO.SNDBUF,
                 &std.mem.toBytes(@as(c_int, 8192)),
@@ -1186,7 +863,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Get bound port and create client
             var sock_len = address.getOsSockLen();
-            const fd = if (xev.dynamic) server.fd() else server.fd;
+            const fd = server.fd;
             try posix.getsockname(fd, &address.any, &sock_len);
             const client = try Impl.init(address);
 

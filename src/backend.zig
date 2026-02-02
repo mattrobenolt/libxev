@@ -1,5 +1,4 @@
 const builtin = @import("builtin");
-const stream = @import("watcher/stream.zig");
 
 /// The backend types.
 pub const Backend = enum {

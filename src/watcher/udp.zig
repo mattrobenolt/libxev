@@ -1,10 +1,10 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
-const stream = @import("stream.zig");
-const common = @import("common.zig");
+
 const ThreadPool = @import("../ThreadPool.zig");
+const common = @import("common.zig");
+const stream = @import("stream.zig");
 
 /// UDP client and server.
 ///
@@ -15,8 +15,6 @@ const ThreadPool = @import("../ThreadPool.zig");
 /// if you have specific needs or want to push for the most optimal performance,
 /// use the platform-specific Loop directly.
 pub fn UDP(comptime xev: type) type {
-    if (xev.dynamic) return UDPDynamic(xev);
-
     return switch (xev.backend) {
         // Supported, uses sendmsg/recvmsg exclusively
         .io_uring => UDPSendMsg(xev),
@@ -204,7 +202,6 @@ fn UDPSendto(comptime xev: type) type {
         }
     };
 }
-
 
 /// UDP implementation that uses sendmsg/recvmsg
 fn UDPSendMsg(comptime xev: type) type {
@@ -474,221 +471,6 @@ fn UDPSendMsg(comptime xev: type) type {
             }
 
             loop.add(c);
-        }
-
-        test {
-            _ = UDPTests(xev, Self);
-        }
-    };
-}
-
-fn UDPDynamic(comptime xev: type) type {
-    return struct {
-        const Self = @This();
-        const FdType = posix.socket_t;
-
-        backend: Union,
-
-        pub const Union = xev.Union(&.{"UDP"});
-        pub const State = xev.Union(&.{ "UDP", "State" });
-
-        const S = stream.Stream(xev, Self, .{
-            .close = true,
-            .poll = true,
-            .type = "UDP",
-        });
-        pub const close = S.close;
-        pub const poll = S.poll;
-
-        pub fn init(addr: std.net.Address) !Self {
-            return .{ .backend = switch (xev.backend) {
-                inline else => |tag| backend: {
-                    const api = (comptime xev.superset(tag)).Api();
-                    break :backend @unionInit(
-                        Union,
-                        @tagName(tag),
-                        try api.UDP.init(addr),
-                    );
-                },
-            } };
-        }
-
-        pub fn initFd(fdvalue: std.posix.pid_t) Self {
-            return .{ .backend = switch (xev.backend) {
-                inline else => |tag| backend: {
-                    const api = (comptime xev.superset(tag)).Api();
-                    break :backend @unionInit(
-                        Union,
-                        @tagName(tag),
-                        api.UDP.initFd(fdvalue),
-                    );
-                },
-            } };
-        }
-
-        pub fn bind(self: Self, addr: std.net.Address) !void {
-            switch (xev.backend) {
-                inline else => |tag| try @field(
-                    self.backend,
-                    @tagName(tag),
-                ).bind(addr),
-            }
-        }
-
-        pub fn fd(self: Self) FdType {
-            switch (xev.backend) {
-                inline else => |tag| return @field(
-                    self.backend,
-                    @tagName(tag),
-                ).fd,
-            }
-        }
-
-        pub fn read(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            s: *State,
-            buf: xev.ReadBuffer,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: *State,
-                addr: std.net.Address,
-                s: Self,
-                b: xev.ReadBuffer,
-                r: xev.ReadError!usize,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    const api = (comptime xev.superset(tag)).Api();
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            st_inner: *api.UDP.State,
-                            addr_inner: std.net.Address,
-                            s_inner: api.UDP,
-                            b_inner: api.ReadBuffer,
-                            r_inner: api.ReadError!usize,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                @fieldParentPtr(
-                                    @tagName(tag),
-                                    st_inner,
-                                ),
-                                addr_inner,
-                                Self.initFd(s_inner.fd),
-                                xev.ReadBuffer.fromBackend(tag, b_inner),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    c.ensureTag(tag);
-                    s.* = @unionInit(State, @tagName(tag), undefined);
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).read(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        &@field(s, @tagName(tag)),
-                        buf.toBackend(tag),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
-        }
-
-        pub fn write(
-            self: Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            s: *State,
-            addr: std.net.Address,
-            buf: xev.WriteBuffer,
-            comptime Userdata: type,
-            userdata: ?*Userdata,
-            comptime cb: *const fn (
-                ud: ?*Userdata,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                s: *State,
-                s: Self,
-                b: xev.WriteBuffer,
-                r: xev.WriteError!usize,
-            ) xev.CallbackAction,
-        ) void {
-            switch (xev.backend) {
-                inline else => |tag| {
-                    const api = (comptime xev.superset(tag)).Api();
-                    const api_cb = (struct {
-                        fn callback(
-                            ud_inner: ?*Userdata,
-                            l_inner: *api.Loop,
-                            c_inner: *api.Completion,
-                            st_inner: *api.UDP.State,
-                            s_inner: api.UDP,
-                            b_inner: api.WriteBuffer,
-                            r_inner: api.WriteError!usize,
-                        ) xev.CallbackAction {
-                            return cb(
-                                ud_inner,
-                                @fieldParentPtr("backend", @as(
-                                    *xev.Loop.Union,
-                                    @fieldParentPtr(@tagName(tag), l_inner),
-                                )),
-                                @fieldParentPtr("value", @as(
-                                    *xev.Completion.Union,
-                                    @fieldParentPtr(@tagName(tag), c_inner),
-                                )),
-                                @fieldParentPtr(
-                                    @tagName(tag),
-                                    st_inner,
-                                ),
-                                Self.initFd(s_inner.fd),
-                                xev.WriteBuffer.fromBackend(tag, b_inner),
-                                r_inner,
-                            );
-                        }
-                    }).callback;
-
-                    c.ensureTag(tag);
-                    s.* = @unionInit(State, @tagName(tag), undefined);
-
-                    @field(
-                        self.backend,
-                        @tagName(tag),
-                    ).write(
-                        &@field(loop.backend, @tagName(tag)),
-                        &@field(c.value, @tagName(tag)),
-                        &@field(s, @tagName(tag)),
-                        addr,
-                        buf.toBackend(tag),
-                        Userdata,
-                        userdata,
-                        api_cb,
-                    );
-                },
-            }
         }
 
         test {
