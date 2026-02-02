@@ -125,6 +125,61 @@ fn TCPStream(comptime xev: type) type {
             loop.add(c);
         }
 
+        /// Accept connections in multishot mode.
+        ///
+        /// In multishot mode, the callback is invoked for each incoming connection
+        /// without needing to rearm the operation. Return `.disarm` from the callback
+        /// to stop accepting connections, or `.rearm` to continue (though on io_uring
+        /// with multishot, rearm is automatic and returning `.rearm` is a no-op).
+        ///
+        /// On io_uring (kernel 5.19+), this uses true multishot accept where a single
+        /// submission can accept multiple connections.
+        ///
+        /// On kqueue, the multishot flag is ignored and you must return `.rearm` from
+        /// the callback to accept additional connections (same behavior as regular
+        /// accept with manual rearming).
+        pub fn acceptMultishot(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                r: xev.AcceptError!Self,
+            ) xev.CallbackAction,
+        ) void {
+            c.* = .{
+                .op = .{
+                    .accept = .{
+                        .socket = self.fd,
+                        .multishot = true,
+                    },
+                },
+
+                .userdata = userdata,
+                .callback = (struct {
+                    fn callback(
+                        ud: ?*anyopaque,
+                        l_inner: *xev.Loop,
+                        c_inner: *xev.Completion,
+                        r: xev.Result,
+                    ) xev.CallbackAction {
+                        return @call(.always_inline, cb, .{
+                            common.userdataValue(Userdata, ud),
+                            l_inner,
+                            c_inner,
+                            if (r.accept) |fd| initFd(fd) else |err| err,
+                        });
+                    }
+                }).callback,
+            };
+
+            loop.add(c);
+        }
+
         /// Establish a connection as a client.
         pub fn connect(
             self: Self,
@@ -496,6 +551,64 @@ fn TCPDynamic(comptime xev: type) type {
                         self.backend,
                         @tagName(tag),
                     ).accept(
+                        &@field(loop.backend, @tagName(tag)),
+                        &@field(c.value, @tagName(tag)),
+                        Userdata,
+                        userdata,
+                        api_cb,
+                    );
+                },
+            }
+        }
+
+        /// Accept connections in multishot mode. See TCPStream.acceptMultishot for details.
+        pub fn acceptMultishot(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                r: xev.AcceptError!Self,
+            ) xev.CallbackAction,
+        ) void {
+            switch (xev.backend) {
+                inline else => |tag| {
+                    c.ensureTag(tag);
+
+                    const api = (comptime xev.superset(tag)).Api();
+                    const api_cb = (struct {
+                        fn callback(
+                            ud_inner: ?*Userdata,
+                            l_inner: *api.Loop,
+                            c_inner: *api.Completion,
+                            r_inner: api.AcceptError!api.TCP,
+                        ) xev.CallbackAction {
+                            return cb(
+                                ud_inner,
+                                @fieldParentPtr("backend", @as(
+                                    *xev.Loop.Union,
+                                    @fieldParentPtr(@tagName(tag), l_inner),
+                                )),
+                                @fieldParentPtr("value", @as(
+                                    *xev.Completion.Union,
+                                    @fieldParentPtr(@tagName(tag), c_inner),
+                                )),
+                                if (r_inner) |tcp|
+                                    initFd(tcp.fd)
+                                else |err|
+                                    err,
+                            );
+                        }
+                    }).callback;
+
+                    @field(
+                        self.backend,
+                        @tagName(tag),
+                    ).acceptMultishot(
                         &@field(loop.backend, @tagName(tag)),
                         &@field(c.value, @tagName(tag)),
                         Userdata,
