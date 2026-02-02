@@ -191,13 +191,29 @@ pub const Loop = struct {
                 // For multishot operations, IORING_CQE_F_MORE indicates more
                 // completions will follow. Don't mark as dead or decrement active.
                 const more = cqe.flags & linux.IORING_CQE_F_MORE != 0;
+
+                // Skip completions that were already disarmed (e.g., from a
+                // previous multishot callback returning .disarm). The kernel
+                // may still send CQEs until the operation fully completes.
+                // We still need to decrement active since each CQE corresponds
+                // to a submission that was counted.
+                if (c.flags.state == .dead) {
+                    if (!more) self.active -= 1;
+                    continue;
+                }
+
                 if (!more) {
                     self.active -= 1;
                     c.flags.state = .dead;
                 }
 
                 switch (c.invoke(self, cqe.res, cqe.flags)) {
-                    .disarm => {},
+                    .disarm => if (more) {
+                        // User wants to stop a multishot operation.
+                        // Mark as inactive so the loop can exit.
+                        self.active -= 1;
+                        c.flags.state = .dead;
+                    },
                     .rearm => if (!more) self.add(c),
                 }
             }
