@@ -80,15 +80,16 @@ pub fn BufferPool(comptime xev: type) type {
         /// For kqueue, this is a no-op.
         pub fn register(self: *Self, loop: *xev.Loop) !void {
             switch (xev.backend) {
-                .io_uring => try self.impl.register(&loop.ring, self.config),
+                .io_uring => try self.impl.register(&loop.ring, self.allocator, self.config),
                 .kqueue => {}, // No-op for kqueue
             }
         }
 
         /// Unregister the buffer pool from the event loop.
         pub fn unregister(self: *Self, loop: *xev.Loop) void {
+            _ = loop;
             switch (xev.backend) {
-                .io_uring => self.impl.unregister(&loop.ring, self.config),
+                .io_uring => self.impl.unregister(self.allocator),
                 .kqueue => {}, // No-op for kqueue
             }
         }
@@ -102,19 +103,15 @@ pub fn BufferPool(comptime xev: type) type {
         }
 
         /// Acquire a buffer from the pool. Returns null if no buffers available.
-        /// For io_uring, buffers are typically acquired by the kernel during recv.
-        /// This method is primarily for kqueue or manual buffer management.
+        /// For io_uring, buffers are acquired by the kernel during recv operations,
+        /// so this method is not supported and will return null.
+        /// For kqueue, this acquires from the user-space pool.
         pub fn acquire(self: *Self) ?Buffer {
             switch (xev.backend) {
                 .io_uring => {
-                    // For io_uring, buffers are managed by the kernel.
-                    // This is used for fallback or manual operations.
-                    const buffer_id = self.impl.acquireFromUserPool() orelse return null;
-                    return .{
-                        .data = self.impl.getBuffer(buffer_id, self.config.size),
-                        .pool = self,
-                        .buffer_id = buffer_id,
-                    };
+                    // For io_uring, buffers are selected by the kernel during recv.
+                    // Manual acquire is not supported.
+                    return null;
                 },
                 .kqueue => {
                     const buffer_id = self.impl.acquire() orelse return null;
@@ -130,7 +127,7 @@ pub fn BufferPool(comptime xev: type) type {
         /// Release a buffer back to the pool.
         pub fn releaseBuffer(self: *Self, buffer_id: u16) void {
             switch (xev.backend) {
-                .io_uring => self.impl.releaseToUserPool(buffer_id),
+                .io_uring => self.impl.putBuffer(buffer_id, self.config.size),
                 .kqueue => self.impl.release(buffer_id),
             }
         }
@@ -152,109 +149,59 @@ pub fn BufferPool(comptime xev: type) type {
             };
         }
 
-        /// io_uring implementation using provided buffer rings.
+        /// io_uring implementation using provided buffer rings (kernel 5.19+).
+        /// Uses BufferGroup which registers a ring-mapped buffer with the kernel.
         const IoUringImpl = struct {
             /// The provided buffer ring registered with io_uring.
-            buf_ring: ?linux.IoUring.BufferGroup = null,
-
-            /// User-space free list for manual acquire/release.
-            /// This is a backup for when we need to acquire buffers manually.
-            user_free_list: std.atomic.Value(u32),
-            user_free_nodes: []std.atomic.Value(u16),
-
-            /// Backing memory for all buffers.
-            buffer_memory: []u8,
+            /// Null until register() is called.
+            buf_group: ?linux.IoUring.BufferGroup = null,
 
             fn init(allocator: Allocator, config: Config) !IoUringImpl {
-                const total_size = @as(usize, config.count) * @as(usize, config.size);
-                const buffer_memory = try allocator.alloc(u8, total_size);
-                errdefer allocator.free(buffer_memory);
-
-                // Initialize user-space free list for manual operations
-                const user_free_nodes = try allocator.alloc(std.atomic.Value(u16), config.count);
-                errdefer allocator.free(user_free_nodes);
-
-                // Build linked list: each node points to next
-                for (0..config.count) |i| {
-                    const idx: u16 = @intCast(i);
-                    if (i + 1 < config.count) {
-                        user_free_nodes[i] = .{ .raw = idx + 1 };
-                    } else {
-                        user_free_nodes[i] = .{ .raw = std.math.maxInt(u16) }; // End marker
-                    }
-                }
-
-                return .{
-                    .buf_ring = null,
-                    .user_free_list = .{ .raw = 0 }, // Head points to first buffer
-                    .user_free_nodes = user_free_nodes,
-                    .buffer_memory = buffer_memory,
-                };
+                _ = allocator;
+                _ = config;
+                // BufferGroup allocates its own memory on register()
+                return .{ .buf_group = null };
             }
 
-            fn register(self: *IoUringImpl, ring: *linux.IoUring, config: Config) !void {
-                if (self.buf_ring != null) return error.AlreadyRegistered;
+            fn register(self: *IoUringImpl, ring: *linux.IoUring, allocator: Allocator, config: Config) !void {
+                if (self.buf_group != null) return error.AlreadyRegistered;
 
-                self.buf_ring = try linux.IoUring.BufferGroup.init(
+                self.buf_group = try linux.IoUring.BufferGroup.init(
                     ring,
+                    allocator,
                     config.group_id,
-                    self.buffer_memory,
                     config.size,
                     config.count,
                 );
             }
 
-            fn unregister(self: *IoUringImpl, ring: *linux.IoUring, config: Config) void {
-                if (self.buf_ring) |*bg| {
-                    bg.deinit(ring, config.group_id);
-                    self.buf_ring = null;
+            fn unregister(self: *IoUringImpl, allocator: Allocator) void {
+                if (self.buf_group) |*bg| {
+                    bg.deinit(allocator);
+                    self.buf_group = null;
                 }
             }
 
             fn deinit(self: *IoUringImpl, allocator: Allocator) void {
-                allocator.free(self.user_free_nodes);
-                allocator.free(self.buffer_memory);
+                // If still registered, unregister first
+                self.unregister(allocator);
             }
 
+            /// Get buffer slice by buffer_id. Accesses BufferGroup's managed memory directly.
             fn getBuffer(self: *IoUringImpl, buffer_id: u16, buffer_size: u32) []u8 {
-                const start = @as(usize, buffer_id) * @as(usize, buffer_size);
-                return self.buffer_memory[start..][0..buffer_size];
+                const bg = &(self.buf_group orelse unreachable);
+                const start = @as(usize, buffer_size) * @as(usize, buffer_id);
+                return bg.buffers[start..][0..buffer_size];
             }
 
-            /// Put a buffer back into the kernel's buffer ring after use.
+            /// Return a buffer to the kernel's buffer ring for reuse.
+            /// Must be called after processing received data.
             pub fn putBuffer(self: *IoUringImpl, buffer_id: u16, buffer_size: u32) void {
-                if (self.buf_ring) |*bg| {
-                    const buf = self.getBuffer(buffer_id, buffer_size);
-                    bg.put(buffer_id, buf);
-                }
-            }
-
-            // User-space pool operations for manual acquire/release
-            fn acquireFromUserPool(self: *IoUringImpl) ?u16 {
-                while (true) {
-                    const head = self.user_free_list.load(.acquire);
-                    if (head == std.math.maxInt(u16)) return null; // Pool exhausted
-
-                    // Clamp to valid range to avoid out of bounds
-                    if (head >= self.user_free_nodes.len) return null;
-
-                    const next = self.user_free_nodes[head].load(.acquire);
-                    if (self.user_free_list.cmpxchgWeak(head, next, .release, .acquire)) |_| {
-                        continue; // CAS failed, retry
-                    }
-                    return head;
-                }
-            }
-
-            fn releaseToUserPool(self: *IoUringImpl, buffer_id: u16) void {
-                while (true) {
-                    const head = self.user_free_list.load(.acquire);
-                    self.user_free_nodes[buffer_id].store(head, .release);
-                    if (self.user_free_list.cmpxchgWeak(buffer_id, head, .release, .acquire)) |_| {
-                        continue; // CAS failed, retry
-                    }
-                    return;
-                }
+                const bg = &(self.buf_group orelse return);
+                const buf = self.getBuffer(buffer_id, buffer_size);
+                const mask = linux.IoUring.buf_ring_mask(bg.buffers_count);
+                linux.IoUring.buf_ring_add(bg.br, buf, buffer_id, mask, 0);
+                linux.IoUring.buf_ring_advance(bg.br, 1);
             }
         };
 
@@ -353,7 +300,11 @@ pub fn BufferPool(comptime xev: type) type {
             defer pool.deinit();
         }
 
-        test "BufferPool: acquire/release cycle" {
+        test "BufferPool: acquire/release cycle (kqueue only)" {
+            // This test is for kqueue's user-space pool. On io_uring, acquire() returns null
+            // because buffers are managed by the kernel.
+            if (xev.backend == .io_uring) return;
+
             const allocator = std.testing.allocator;
             var pool = try Self.init(allocator, .{ .count = 4, .size = 256 });
             defer pool.deinit();
@@ -382,7 +333,10 @@ pub fn BufferPool(comptime xev: type) type {
             }
         }
 
-        test "BufferPool: pool exhaustion returns null" {
+        test "BufferPool: pool exhaustion returns null (kqueue only)" {
+            // This test is for kqueue's user-space pool.
+            if (xev.backend == .io_uring) return;
+
             const allocator = std.testing.allocator;
             var pool = try Self.init(allocator, .{ .count = 2, .size = 128 });
             defer pool.deinit();
@@ -399,7 +353,10 @@ pub fn BufferPool(comptime xev: type) type {
             b2.?.release();
         }
 
-        test "BufferPool: buffer data is accessible" {
+        test "BufferPool: buffer data is accessible (kqueue only)" {
+            // This test is for kqueue's user-space pool.
+            if (xev.backend == .io_uring) return;
+
             const allocator = std.testing.allocator;
             var pool = try Self.init(allocator, .{ .count = 2, .size = 64 });
             defer pool.deinit();
