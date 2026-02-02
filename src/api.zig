@@ -47,6 +47,8 @@ pub fn Xev(comptime be: Backend, comptime T: type) type {
         pub const ShutdownError = T.ShutdownError;
         pub const WriteError = T.WriteError;
         pub const ReadError = T.ReadError;
+        pub const RecvPoolError = T.RecvPoolError;
+        pub const RecvPoolResult = T.RecvPoolResult;
 
         /// Shared stream types
         const SharedStream = stream.Shared(Self);
@@ -64,6 +66,7 @@ pub fn Xev(comptime be: Backend, comptime T: type) type {
         pub const Timer = @import("watcher/timer.zig").Timer(Self);
         pub const TCP = @import("watcher/tcp.zig").TCP(Self);
         pub const UDP = @import("watcher/udp.zig").UDP(Self);
+        pub const BufferPool = @import("BufferPool.zig").BufferPool(Self);
 
         /// The callback of the main Loop operations. Higher level interfaces may
         /// use a different callback mechanism.

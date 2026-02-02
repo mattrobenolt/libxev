@@ -196,7 +196,7 @@ pub const Loop = struct {
                     c.flags.state = .dead;
                 }
 
-                switch (c.invoke(self, cqe.res)) {
+                switch (c.invoke(self, cqe.res, cqe.flags)) {
                     .disarm => {},
                     .rearm => if (!more) self.add(c),
                 }
@@ -566,6 +566,14 @@ pub const Loop = struct {
             },
 
             .cancel => |v| sqe.prep_cancel(@intCast(@intFromPtr(v.c)), 0),
+
+            .recv_pool => |*v| {
+                // Use recv with null buffer - kernel will select from buffer group
+                sqe.prep_recv(v.fd, @as([*]u8, undefined)[0..0], 0);
+                sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+                sqe.buf_index = v.buffer_group_id;
+                if (v.multishot) sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+            },
         }
 
         // Our sqe user data always points back to the completion.
@@ -670,7 +678,7 @@ pub const Completion = struct {
 
     /// Invokes the callback for this completion after properly constructing
     /// the Result based on the res code.
-    fn invoke(self: *Completion, loop: *Loop, res: i32) CallbackAction {
+    fn invoke(self: *Completion, loop: *Loop, res: i32, cqe_flags: u32) CallbackAction {
         const result: Result = switch (self.op) {
             .noop => unreachable,
 
@@ -816,6 +824,25 @@ pub const Completion = struct {
                     else => |errno| posix.unexpectedErrno(errno),
                 },
             },
+
+            .recv_pool => .{
+                .recv_pool = .{
+                    .result = if (res > 0)
+                        @intCast(res)
+                    else if (res == 0)
+                        error.EOF
+                    else switch (@as(posix.E, @enumFromInt(-res))) {
+                        .CANCELED => error.Canceled,
+                        .CONNRESET => error.ConnectionResetByPeer,
+                        .NOBUFS => error.NoBuffersAvailable,
+                        else => |errno| posix.unexpectedErrno(errno),
+                    },
+                    .buffer_id = if (cqe_flags & linux.IORING_CQE_F_BUFFER != 0)
+                        @as(u16, @intCast(cqe_flags >> linux.IORING_CQE_BUFFER_SHIFT))
+                    else
+                        null,
+                },
+            },
         };
 
         return self.callback(self.userdata, loop, self, result);
@@ -900,6 +927,9 @@ pub const OperationType = enum {
 
     /// Cancel an existing operation.
     cancel,
+
+    /// Receive with provided buffer pool (kernel 6.0+).
+    recv_pool,
 };
 
 /// The result type based on the operation type. For a callback, the
@@ -922,6 +952,7 @@ pub const Result = union(OperationType) {
     timer: TimerError!TimerTrigger,
     timer_remove: TimerRemoveError!void,
     cancel: CancelError!void,
+    recv_pool: RecvPoolResult,
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1037,6 +1068,17 @@ pub const Operation = union(OperationType) {
     cancel: struct {
         c: *Completion,
     },
+
+    recv_pool: struct {
+        fd: posix.fd_t,
+        buffer_group_id: u16,
+        /// Opaque pointer to the BufferPool for buffer retrieval in callback
+        pool: *anyopaque,
+        /// Enable multishot mode. When enabled, the completion will fire
+        /// multiple times as data arrives without needing to be rearmed.
+        /// Requires kernel 6.0+.
+        multishot: bool = false,
+    },
 };
 
 /// ReadBuffer are the various options for reading.
@@ -1143,6 +1185,19 @@ pub const TimerTrigger = enum {
 
     /// Timer was canceled.
     cancel,
+};
+
+pub const RecvPoolError = error{
+    EOF,
+    Canceled,
+    NoBuffersAvailable,
+    ConnectionResetByPeer,
+    Unexpected,
+};
+
+pub const RecvPoolResult = struct {
+    result: RecvPoolError!usize,
+    buffer_id: ?u16,
 };
 
 test "Completion size" {

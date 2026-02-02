@@ -804,6 +804,12 @@ pub const Loop = struct {
                 // We always run timers
                 break :action .{ .timer = {} };
             },
+
+            .recv_pool => action: {
+                // Buffer should already be acquired by higher-level code
+                ev.* = c.kevent().?;
+                break :action .{ .kevent = {} };
+            },
         };
 
         switch (action) {
@@ -1099,6 +1105,15 @@ pub const Completion = struct {
                 .data = 0,
                 .udata = @intFromPtr(self),
             }),
+
+            .recv_pool => |v| kevent_init(.{
+                .ident = @intCast(v.fd),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = @intFromPtr(self),
+            }),
         };
     }
 
@@ -1257,6 +1272,19 @@ pub const Completion = struct {
                 posix.close(op.fd);
                 break :res .{ .close = {} };
             },
+
+            .recv_pool => |*op| res: {
+                const n_ = posix.recv(op.fd, op.buffer, 0);
+                break :res .{
+                    .recv_pool = .{
+                        .result = if (n_) |n|
+                            if (n == 0) error.EOF else n
+                        else |err|
+                            err,
+                        .buffer_id = op.buffer_id,
+                    },
+                };
+            },
         };
     }
 
@@ -1406,6 +1434,18 @@ pub const Completion = struct {
                     },
                 },
             },
+
+            .recv_pool => |*op| .{
+                .recv_pool = .{
+                    .result = switch (errno) {
+                        .SUCCESS => if (r == 0) error.EOF else @intCast(r),
+                        .CANCELED => error.Canceled,
+                        .PERM => error.PermissionDenied,
+                        else => |err| posix.unexpectedErrno(err),
+                    },
+                    .buffer_id = op.buffer_id,
+                },
+            },
         };
     }
 };
@@ -1476,6 +1516,7 @@ pub const OperationType = enum {
     cancel,
     machport,
     proc,
+    recv_pool,
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1575,6 +1616,16 @@ pub const Operation = union(OperationType) {
         pid: posix.pid_t,
         flags: u32 = NOTE_EXIT_FLAGS,
     },
+
+    recv_pool: struct {
+        fd: posix.fd_t,
+        /// Opaque pointer to the BufferPool
+        pool: *anyopaque,
+        /// Buffer ID acquired from the pool (set during start)
+        buffer_id: u16 = undefined,
+        /// Buffer slice (set during start)
+        buffer: []u8 = undefined,
+    },
 };
 
 pub const Result = union(OperationType) {
@@ -1595,6 +1646,7 @@ pub const Result = union(OperationType) {
     cancel: CancelError!void,
     machport: MachPortError!void,
     proc: ProcError!u32,
+    recv_pool: RecvPoolResult,
 };
 
 const ThreadPoolError = error{
@@ -1676,6 +1728,21 @@ pub const TimerTrigger = enum {
 
     /// Timer was canceled.
     cancel,
+};
+
+pub const RecvPoolError = posix.KEventError ||
+    posix.RecvFromError ||
+    error{
+        EOF,
+        Canceled,
+        NoBuffersAvailable,
+        PermissionDenied,
+        Unexpected,
+    };
+
+pub const RecvPoolResult = struct {
+    result: RecvPoolError!usize,
+    buffer_id: u16,
 };
 
 /// ReadBuffer are the various options for reading.
@@ -1823,7 +1890,7 @@ inline fn kevent_init(ev: posix.Kevent) Kevent {
 }
 
 comptime {
-    if (@sizeOf(Completion) != 256) {
+    if (@sizeOf(Completion) != 264) {
         @compileLog(@sizeOf(Completion));
         unreachable;
     }

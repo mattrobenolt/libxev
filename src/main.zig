@@ -38,6 +38,9 @@ pub const Stream = stream.GenericStream;
 pub const Timer = xev.Timer;
 pub const TCP = xev.TCP;
 pub const UDP = xev.UDP;
+pub const BufferPool = xev.BufferPool;
+pub const RecvPoolError = xev.RecvPoolError;
+pub const RecvPoolResult = xev.RecvPoolResult;
 
 comptime {
     // This ensures that all the public decls from the API are forwarded
