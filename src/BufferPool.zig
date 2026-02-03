@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
-const linux = std.os.linux;
+const IoUring = std.os.linux.IoUring;
 
 /// BufferPool provides efficient buffer management for receive operations.
 /// On io_uring (kernel 6.0+), uses IORING_REGISTER_PBUF_RING for kernel-managed
@@ -10,6 +10,11 @@ const linux = std.os.linux;
 pub fn BufferPool(comptime xev: type) type {
     return struct {
         const Self = @This();
+
+        const Impl = switch (xev.backend) {
+            .io_uring => IoUringImpl,
+            .kqueue => KqueueImpl,
+        };
 
         pub const Config = struct {
             /// Number of buffers in the pool. Must be a power of 2 for io_uring.
@@ -48,10 +53,7 @@ pub fn BufferPool(comptime xev: type) type {
         };
 
         /// Backend-specific implementation.
-        impl: switch (xev.backend) {
-            .io_uring => IoUringImpl,
-            .kqueue => KqueueImpl,
-        },
+        impl: Impl,
 
         config: Config,
         allocator: Allocator,
@@ -62,13 +64,8 @@ pub fn BufferPool(comptime xev: type) type {
             if (config.count == 0) return error.InvalidCount;
             if (config.size == 0) return error.InvalidSize;
 
-            const impl = switch (xev.backend) {
-                .io_uring => try IoUringImpl.init(allocator, config),
-                .kqueue => try KqueueImpl.init(allocator, config),
-            };
-
             return .{
-                .impl = impl,
+                .impl = try Impl.init(allocator, config),
                 .config = config,
                 .allocator = allocator,
             };
@@ -95,10 +92,8 @@ pub fn BufferPool(comptime xev: type) type {
 
         /// Deinitialize the buffer pool and free all memory.
         pub fn deinit(self: *Self) void {
-            switch (xev.backend) {
-                .io_uring => self.impl.deinit(self.allocator),
-                .kqueue => self.impl.deinit(self.allocator),
-            }
+            self.impl.deinit(self.allocator);
+            self.* = undefined;
         }
 
         /// Acquire a buffer from the pool. Returns null if no buffers available.
@@ -107,11 +102,9 @@ pub fn BufferPool(comptime xev: type) type {
         /// For kqueue, this acquires from the user-space pool.
         pub fn acquire(self: *Self) ?Buffer {
             switch (xev.backend) {
-                .io_uring => {
-                    // For io_uring, buffers are selected by the kernel during recv.
-                    // Manual acquire is not supported.
-                    return null;
-                },
+                // For io_uring, buffers are selected by the kernel during recv.
+                // Manual acquire is not supported.
+                .io_uring => return null,
                 .kqueue => {
                     const buffer_id = self.impl.acquire() orelse return null;
                     return .{
@@ -134,13 +127,9 @@ pub fn BufferPool(comptime xev: type) type {
         /// Get a buffer by ID and convert a CQE result to a Recv.
         /// Used internally by recv_pool operations.
         pub fn getRecvFromResult(self: *Self, buffer_id: u16, bytes_read: usize) Recv {
-            const buffer_data = switch (xev.backend) {
-                .io_uring => self.impl.getBuffer(buffer_id, self.config.size),
-                .kqueue => self.impl.getBuffer(buffer_id, self.config.size),
-            };
             return .{
                 .buffer = .{
-                    .data = buffer_data,
+                    .data = self.impl.getBuffer(buffer_id, self.config.size),
                     .pool = self,
                     .buffer_id = buffer_id,
                 },
@@ -153,7 +142,7 @@ pub fn BufferPool(comptime xev: type) type {
         const IoUringImpl = struct {
             /// The provided buffer ring registered with io_uring.
             /// Null until register() is called.
-            buf_group: ?linux.IoUring.BufferGroup = null,
+            buf_group: ?IoUring.BufferGroup = null,
 
             fn init(allocator: Allocator, config: Config) !IoUringImpl {
                 _ = allocator;
@@ -162,10 +151,10 @@ pub fn BufferPool(comptime xev: type) type {
                 return .{ .buf_group = null };
             }
 
-            fn register(self: *IoUringImpl, ring: *linux.IoUring, allocator: Allocator, config: Config) !void {
+            fn register(self: *IoUringImpl, ring: *IoUring, allocator: Allocator, config: Config) !void {
                 if (self.buf_group != null) return error.AlreadyRegistered;
 
-                self.buf_group = try linux.IoUring.BufferGroup.init(
+                self.buf_group = try .init(
                     ring,
                     allocator,
                     config.group_id,
@@ -198,9 +187,9 @@ pub fn BufferPool(comptime xev: type) type {
             pub fn putBuffer(self: *IoUringImpl, buffer_id: u16, buffer_size: u32) void {
                 const bg = &(self.buf_group orelse return);
                 const buf = self.getBuffer(buffer_id, buffer_size);
-                const mask = linux.IoUring.buf_ring_mask(bg.buffers_count);
-                linux.IoUring.buf_ring_add(bg.br, buf, buffer_id, mask, 0);
-                linux.IoUring.buf_ring_advance(bg.br, 1);
+                const mask = IoUring.buf_ring_mask(bg.buffers_count);
+                IoUring.buf_ring_add(bg.br, buf, buffer_id, mask, 0);
+                IoUring.buf_ring_advance(bg.br, 1);
             }
         };
 
