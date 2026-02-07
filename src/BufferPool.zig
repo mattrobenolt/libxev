@@ -133,9 +133,20 @@ pub fn BufferPool(comptime xev: type) type {
 
         /// Get a buffer by ID and convert a CQE result to a Recv.
         /// Used internally by recv_pool operations.
+        ///
+        /// On io_uring with INC mode, returns the full available buffer from the
+        /// heads offset (not sliced to cqe.res). Callers needing only the received
+        /// bytes should use `Recv.data()` which slices to `[0..n]`.
         pub fn getRecvFromResult(self: *Self, buffer_id: u16, bytes_read: usize, cqe: Cqe) Recv {
             const buf_data = switch (xev.backend) {
-                .io_uring => self.impl.buf_group.?.get(cqe) catch unreachable,
+                .io_uring => blk: {
+                    // Replicate get_by_id logic (private in std) to get the full
+                    // available buffer, not sliced to cqe.res. This allows callers
+                    // to reuse the buffer as scratch space (e.g. for TLS decryption).
+                    const bg = self.impl.buf_group.?;
+                    const pos = bg.buffer_size * buffer_id;
+                    break :blk bg.buffers[pos .. pos + bg.buffer_size][bg.heads[buffer_id]..];
+                },
                 .kqueue => self.impl.getBuffer(buffer_id, self.config.size),
             };
             return .{
