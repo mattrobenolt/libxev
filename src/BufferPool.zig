@@ -2,7 +2,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
-const IoUring = std.os.linux.IoUring;
+const linux = std.os.linux;
+const IoUring = linux.IoUring;
 
 /// BufferPool provides efficient buffer management for receive operations.
 /// On io_uring (kernel 6.0+), uses IORING_REGISTER_PBUF_RING for kernel-managed
@@ -25,14 +26,19 @@ pub fn BufferPool(comptime xev: type) type {
             group_id: u16 = 0,
         };
 
+        /// On io_uring, the CQE carries buffer flags needed for correct INC
+        /// mode buffer lifecycle (BUF_MORE, res). On kqueue, this is void.
+        const Cqe = if (xev.backend == .io_uring) linux.io_uring_cqe else void;
+
         pub const Buffer = struct {
             data: []u8,
             pool: *Self,
             buffer_id: u16,
+            cqe: Cqe,
 
             /// Release the buffer back to the pool for reuse.
             pub fn release(self: Buffer) void {
-                self.pool.releaseBuffer(self.buffer_id);
+                self.pool.releaseBuffer(self.buffer_id, self.cqe);
             }
         };
 
@@ -111,27 +117,33 @@ pub fn BufferPool(comptime xev: type) type {
                         .data = self.impl.getBuffer(buffer_id, self.config.size),
                         .pool = self,
                         .buffer_id = buffer_id,
+                        .cqe = {},
                     };
                 },
             }
         }
 
         /// Release a buffer back to the pool.
-        pub fn releaseBuffer(self: *Self, buffer_id: u16) void {
+        pub fn releaseBuffer(self: *Self, buffer_id: u16, cqe: Cqe) void {
             switch (xev.backend) {
-                .io_uring => self.impl.putBuffer(buffer_id, self.config.size),
+                .io_uring => self.impl.buf_group.?.put(cqe) catch unreachable,
                 .kqueue => self.impl.release(buffer_id),
             }
         }
 
         /// Get a buffer by ID and convert a CQE result to a Recv.
         /// Used internally by recv_pool operations.
-        pub fn getRecvFromResult(self: *Self, buffer_id: u16, bytes_read: usize) Recv {
+        pub fn getRecvFromResult(self: *Self, buffer_id: u16, bytes_read: usize, cqe: Cqe) Recv {
+            const buf_data = switch (xev.backend) {
+                .io_uring => self.impl.buf_group.?.get(cqe) catch unreachable,
+                .kqueue => self.impl.getBuffer(buffer_id, self.config.size),
+            };
             return .{
                 .buffer = .{
-                    .data = self.impl.getBuffer(buffer_id, self.config.size),
+                    .data = buf_data,
                     .pool = self,
                     .buffer_id = buffer_id,
+                    .cqe = cqe,
                 },
                 .n = bytes_read,
             };
@@ -173,23 +185,6 @@ pub fn BufferPool(comptime xev: type) type {
             fn deinit(self: *IoUringImpl, allocator: Allocator) void {
                 // If still registered, unregister first
                 self.unregister(allocator);
-            }
-
-            /// Get buffer slice by buffer_id. Accesses BufferGroup's managed memory directly.
-            fn getBuffer(self: *IoUringImpl, buffer_id: u16, buffer_size: u32) []u8 {
-                const bg = &(self.buf_group orelse unreachable);
-                const start = @as(usize, buffer_size) * @as(usize, buffer_id);
-                return bg.buffers[start..][0..buffer_size];
-            }
-
-            /// Return a buffer to the kernel's buffer ring for reuse.
-            /// Must be called after processing received data.
-            pub fn putBuffer(self: *IoUringImpl, buffer_id: u16, buffer_size: u32) void {
-                const bg = &(self.buf_group orelse return);
-                const buf = self.getBuffer(buffer_id, buffer_size);
-                const mask = IoUring.buf_ring_mask(bg.buffers_count);
-                IoUring.buf_ring_add(bg.br, buf, buffer_id, mask, 0);
-                IoUring.buf_ring_advance(bg.br, 1);
             }
         };
 

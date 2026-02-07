@@ -314,9 +314,9 @@ fn TCPStream(comptime xev: type) type {
 
                                 const user_result: xev.RecvPoolError!xev.BufferPool.Recv = blk: {
                                     const bytes_read = res.result catch |err| break :blk err;
-                                    const buffer_id = res.buffer_id orelse break :blk error.NoBuffersAvailable;
+                                    const buffer_id = res.cqe.buffer_id() catch break :blk error.NoBuffersAvailable;
                                     // Don't return buffer to kernel here - user will call release() when done
-                                    break :blk pool_ptr.getRecvFromResult(buffer_id, bytes_read);
+                                    break :blk pool_ptr.getRecvFromResult(buffer_id, bytes_read, res.cqe);
                                 };
 
                                 return @call(.always_inline, cb, .{
@@ -389,10 +389,10 @@ fn TCPStream(comptime xev: type) type {
                                 const user_result: xev.RecvPoolError!xev.BufferPool.Recv = blk: {
                                     const bytes_read = res.result catch |err| {
                                         // Release the buffer on error
-                                        pool_ptr.releaseBuffer(res.buffer_id);
+                                        pool_ptr.releaseBuffer(res.buffer_id, {});
                                         break :blk err;
                                     };
-                                    break :blk pool_ptr.getRecvFromResult(res.buffer_id, bytes_read);
+                                    break :blk pool_ptr.getRecvFromResult(res.buffer_id, bytes_read, {});
                                 };
 
                                 const action = @call(.always_inline, cb, .{

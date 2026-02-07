@@ -854,10 +854,7 @@ pub const Completion = struct {
                         .NOBUFS => error.NoBuffersAvailable,
                         else => |errno| posix.unexpectedErrno(errno),
                     },
-                    .buffer_id = if (cqe_flags & linux.IORING_CQE_F_BUFFER != 0)
-                        @as(u16, @intCast(cqe_flags >> linux.IORING_CQE_BUFFER_SHIFT))
-                    else
-                        null,
+                    .cqe = .{ .user_data = 0, .res = res, .flags = cqe_flags },
                 },
             },
         };
@@ -1214,7 +1211,7 @@ pub const RecvPoolError = error{
 
 pub const RecvPoolResult = struct {
     result: RecvPoolError!usize,
-    buffer_id: ?u16,
+    cqe: linux.io_uring_cqe,
 };
 
 test "Completion size" {
