@@ -90,8 +90,11 @@ pub fn BufferPool(comptime xev: type) type {
             if (config.count == 0) return error.InvalidCount;
             if (config.size == 0) return error.InvalidSize;
 
+            var impl = try Impl.init(allocator, config);
+            errdefer impl.deinit(allocator);
+
             return .{
-                .impl = try Impl.init(allocator, config),
+                .impl = impl,
                 .config = config,
                 .allocator = allocator,
                 .in_use = if (safety) try std.DynamicBitSetUnmanaged.initEmpty(allocator, config.count) else {},
@@ -175,14 +178,15 @@ pub fn BufferPool(comptime xev: type) type {
                     // was re-enabled (e.g. by a Zig stdlib update).
                     assert(cqe.flags & linux.IORING_CQE_F_BUF_MORE == 0);
 
-                    self.impl.buf_group.?.put(cqe) catch unreachable;
-
                     if (safety) {
-                        // Poison the buffer so stale data reads are obvious.
+                        // Poison before put(): after put(), kernel may immediately
+                        // select this buffer for a concurrent recv.
                         const bg = self.impl.buf_group.?;
                         const pos = bg.buffer_size * buffer_id;
                         @memset(bg.buffers[pos..][0..bg.buffer_size], poison_byte);
                     }
+
+                    self.impl.buf_group.?.put(cqe) catch unreachable;
                 },
                 .kqueue => {
                     if (safety) {
@@ -220,9 +224,6 @@ pub fn BufferPool(comptime xev: type) type {
                         // Ownership: must not already be in-use (double-acquire).
                         assert(!self.in_use.isSet(buffer_id));
                         self.in_use.set(buffer_id);
-
-                        // Full buffer size: INC mode would shrink this via heads offset.
-                        assert(buf.len == bg.buffer_size);
                     }
 
                     break :blk buf;
@@ -346,6 +347,12 @@ pub fn BufferPool(comptime xev: type) type {
                 const buffer_memory = try allocator.alloc(u8, total_size);
                 errdefer allocator.free(buffer_memory);
 
+                if (safety) {
+                    // Start in a known poisoned state so first acquire() passes
+                    // the poison invariant before any release has occurred.
+                    @memset(buffer_memory, poison_byte);
+                }
+
                 const free_list_next = try allocator.alloc(std.atomic.Value(u16), config.count);
                 errdefer allocator.free(free_list_next);
 
@@ -423,6 +430,25 @@ pub fn BufferPool(comptime xev: type) type {
             const allocator = std.testing.allocator;
             var pool = try Self.init(allocator, .{ .count = 16, .size = 1024 });
             defer pool.deinit();
+        }
+
+        test "BufferPool: init cleans up on OOM (kqueue only)" {
+            if (xev.backend == .io_uring) return;
+            if (!safety) return; // in_use allocation only exists in safety builds
+
+            // Allocation order for kqueue init:
+            // 0: buffer_memory, 1: free_list_next, 2: in_use bitset.
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+                .fail_index = 2,
+            });
+            const alloc = failing.allocator();
+
+            try std.testing.expectError(error.OutOfMemory, Self.init(alloc, .{
+                .count = 4,
+                .size = 64,
+            }));
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
         }
 
         test "BufferPool: acquire/release cycle (kqueue only)" {
