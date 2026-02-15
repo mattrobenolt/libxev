@@ -5,9 +5,25 @@ const posix = std.posix;
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
 
+const safety = std.debug.runtime_safety;
+
+/// Poison byte written to buffers on release (debug/ReleaseSafe only).
+/// Chosen to be an invalid TLS content type so it's immediately obvious
+/// if stale data leaks through to a TLS parser.
+const poison_byte: u8 = 0xDE;
+
 /// BufferPool provides efficient buffer management for receive operations.
 /// On io_uring (kernel 6.0+), uses IORING_REGISTER_PBUF_RING for kernel-managed
 /// provided buffer rings. On kqueue, falls back to a user-space lock-free pool.
+///
+/// Debug safety features (compiled out in ReleaseFast):
+/// - Ownership tracking: detects double-release and use-after-release
+/// - Poison fill: buffers are filled with 0xDE on release, verified on acquire
+/// - Full buffer size assertion: detects INC mode head offset corruption
+///
+/// Always-on safety (all build modes):
+/// - INC mode canary: asserts heads[buffer_id] == 0 on acquire
+/// - BUF_MORE flag check: asserts kernel didn't set incremental consumption flag
 pub fn BufferPool(comptime xev: type) type {
     return struct {
         const Self = @This();
@@ -64,6 +80,10 @@ pub fn BufferPool(comptime xev: type) type {
         config: Config,
         allocator: Allocator,
 
+        /// Debug-only: bitset tracking which buffers are currently in-use.
+        /// Detects double-release and use-after-release bugs.
+        in_use: if (safety) std.DynamicBitSetUnmanaged else void,
+
         /// Initialize a new buffer pool.
         pub fn init(allocator: Allocator, config: Config) !Self {
             // Validate config
@@ -74,6 +94,7 @@ pub fn BufferPool(comptime xev: type) type {
                 .impl = try Impl.init(allocator, config),
                 .config = config,
                 .allocator = allocator,
+                .in_use = if (safety) try std.DynamicBitSetUnmanaged.initEmpty(allocator, config.count) else {},
             };
         }
 
@@ -98,6 +119,11 @@ pub fn BufferPool(comptime xev: type) type {
 
         /// Deinitialize the buffer pool and free all memory.
         pub fn deinit(self: *Self) void {
+            if (safety) {
+                // Assert no buffers are still in-use at shutdown.
+                assert(self.in_use.count() == 0);
+                self.in_use.deinit(self.allocator);
+            }
             self.impl.deinit(self.allocator);
             self.* = undefined;
         }
@@ -113,6 +139,17 @@ pub fn BufferPool(comptime xev: type) type {
                 .io_uring => return null,
                 .kqueue => {
                     const buffer_id = self.impl.acquire() orelse return null;
+
+                    if (safety) {
+                        // Ownership: must not already be in-use.
+                        assert(!self.in_use.isSet(buffer_id));
+                        self.in_use.set(buffer_id);
+
+                        // Poison check: verify buffer was poisoned on last release.
+                        const buf = self.impl.getBuffer(buffer_id, self.config.size);
+                        for (buf) |byte| assert(byte == poison_byte);
+                    }
+
                     return .{
                         .data = self.impl.getBuffer(buffer_id, self.config.size),
                         .pool = self,
@@ -125,27 +162,70 @@ pub fn BufferPool(comptime xev: type) type {
 
         /// Release a buffer back to the pool.
         pub fn releaseBuffer(self: *Self, buffer_id: u16, cqe: Cqe) void {
+            if (safety) {
+                // Ownership: must be currently in-use.
+                assert(self.in_use.isSet(buffer_id));
+                self.in_use.unset(buffer_id);
+            }
+
             switch (xev.backend) {
-                .io_uring => self.impl.buf_group.?.put(cqe) catch unreachable,
-                .kqueue => self.impl.release(buffer_id),
+                .io_uring => {
+                    // Always-on: INC mode must not be active. BUF_MORE means the
+                    // kernel retained buffer ownership — if this fires, INC mode
+                    // was re-enabled (e.g. by a Zig stdlib update).
+                    assert(cqe.flags & linux.IORING_CQE_F_BUF_MORE == 0);
+
+                    self.impl.buf_group.?.put(cqe) catch unreachable;
+
+                    if (safety) {
+                        // Poison the buffer so stale data reads are obvious.
+                        const bg = self.impl.buf_group.?;
+                        const pos = bg.buffer_size * buffer_id;
+                        @memset(bg.buffers[pos..][0..bg.buffer_size], poison_byte);
+                    }
+                },
+                .kqueue => {
+                    if (safety) {
+                        // Poison the buffer so stale data reads are obvious.
+                        const buf = self.impl.getBuffer(buffer_id, self.config.size);
+                        @memset(buf, poison_byte);
+                    }
+                    self.impl.release(buffer_id);
+                },
             }
         }
 
         /// Get a buffer by ID and convert a CQE result to a Recv.
         /// Used internally by recv_pool operations.
         ///
-        /// On io_uring with INC mode, returns the full available buffer from the
-        /// heads offset (not sliced to cqe.res). Callers needing only the received
-        /// bytes should use `Recv.data()` which slices to `[0..n]`.
+        /// Returns the full available buffer (not sliced to cqe.res). Callers
+        /// needing only the received bytes should use `Recv.data()`.
         pub fn getRecvFromResult(self: *Self, buffer_id: u16, bytes_read: usize, cqe: Cqe) Recv {
             const buf_data = switch (xev.backend) {
                 .io_uring => blk: {
-                    // Replicate get_by_id logic (private in std) to get the full
-                    // available buffer, not sliced to cqe.res. This allows callers
-                    // to reuse the buffer as scratch space (e.g. for TLS decryption).
                     const bg = self.impl.buf_group.?;
+
+                    // Always-on: INC mode canary. If heads[buffer_id] != 0,
+                    // INC mode advanced the head — our initBufferGroupNoInc
+                    // didn't take effect (e.g. Zig stdlib changed).
+                    assert(bg.heads[buffer_id] == 0);
+
+                    // Always-on: verify BUF_MORE is not set on this CQE.
+                    assert(cqe.flags & linux.IORING_CQE_F_BUF_MORE == 0);
+
                     const pos = bg.buffer_size * buffer_id;
-                    break :blk bg.buffers[pos .. pos + bg.buffer_size][bg.heads[buffer_id]..];
+                    const buf = bg.buffers[pos..][0..bg.buffer_size];
+
+                    if (safety) {
+                        // Ownership: must not already be in-use (double-acquire).
+                        assert(!self.in_use.isSet(buffer_id));
+                        self.in_use.set(buffer_id);
+
+                        // Full buffer size: INC mode would shrink this via heads offset.
+                        assert(buf.len == bg.buffer_size);
+                    }
+
+                    break :blk buf;
                 },
                 .kqueue => self.impl.getBuffer(buffer_id, self.config.size),
             };
@@ -177,13 +257,64 @@ pub fn BufferPool(comptime xev: type) type {
             fn register(self: *IoUringImpl, ring: *IoUring, allocator: Allocator, config: Config) !void {
                 if (self.buf_group != null) return error.AlreadyRegistered;
 
-                self.buf_group = try .init(
+                self.buf_group = try initBufferGroupNoInc(
                     ring,
                     allocator,
                     config.group_id,
                     config.size,
                     config.count,
                 );
+            }
+
+            /// Initialize a BufferGroup WITHOUT INC (incremental consumption) mode.
+            ///
+            /// The Zig 0.15 stdlib BufferGroup.init unconditionally enables INC mode,
+            /// which causes the kernel (6.12+) to set BUF_MORE on recv completions
+            /// and retain buffer ownership. This breaks shared buffer pool patterns
+            /// where multiple connections acquire/release buffers independently:
+            ///
+            /// - put() advances heads[buffer_id] instead of returning buffer to ring
+            /// - Next connection gets the buffer at wrong offset with stale data
+            /// - Silent data corruption between connections
+            ///
+            /// This function replicates BufferGroup.init but passes .inc = false,
+            /// restoring classic provided buffer ring semantics.
+            ///
+            /// See: https://codeberg.org/ziglang/zig/commit/c133171567fe3a81f817d0ea159bd9229d75291c
+            fn initBufferGroupNoInc(
+                ring: *IoUring,
+                allocator: Allocator,
+                group_id: u16,
+                buffer_size: u32,
+                buffers_count: u16,
+            ) !IoUring.BufferGroup {
+                const buffers = try allocator.alloc(u8, buffer_size * buffers_count);
+                errdefer allocator.free(buffers);
+                const heads = try allocator.alloc(u32, buffers_count);
+                errdefer allocator.free(heads);
+
+                const br = try IoUring.setup_buf_ring(ring.fd, buffers_count, group_id, .{ .inc = false });
+                IoUring.buf_ring_init(br);
+
+                const mask = IoUring.buf_ring_mask(buffers_count);
+                var i: u16 = 0;
+                while (i < buffers_count) : (i += 1) {
+                    const pos = buffer_size * i;
+                    const buf = buffers[pos .. pos + buffer_size];
+                    heads[i] = 0;
+                    IoUring.buf_ring_add(br, buf, i, mask, i);
+                }
+                IoUring.buf_ring_advance(br, buffers_count);
+
+                return .{
+                    .ring = ring,
+                    .group_id = group_id,
+                    .br = br,
+                    .buffers = buffers,
+                    .heads = heads,
+                    .buffer_size = buffer_size,
+                    .buffers_count = buffers_count,
+                };
             }
 
             fn unregister(self: *IoUringImpl, allocator: Allocator) void {
@@ -362,6 +493,29 @@ pub fn BufferPool(comptime xev: type) type {
             @memset(buf.data, 0xAB);
             try std.testing.expectEqual(@as(u8, 0xAB), buf.data[0]);
             try std.testing.expectEqual(@as(usize, 64), buf.data.len);
+        }
+
+        test "BufferPool: poison fill on release (kqueue only)" {
+            if (xev.backend == .io_uring) return;
+            if (!safety) return; // Poison only active in debug/ReleaseSafe
+
+            const allocator = std.testing.allocator;
+            var pool = try Self.init(allocator, .{ .count = 2, .size = 32 });
+            defer pool.deinit();
+
+            // Acquire, write data, release
+            const buf1 = pool.acquire().?;
+            @memset(buf1.data, 0xFF);
+            buf1.release();
+
+            // Re-acquire the same buffer — should be poisoned
+            const buf2 = pool.acquire().?;
+            defer buf2.release();
+
+            // Buffer should be filled with poison bytes
+            for (buf2.data) |byte| {
+                try std.testing.expectEqual(poison_byte, byte);
+            }
         }
     };
 }
