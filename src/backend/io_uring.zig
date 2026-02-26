@@ -433,8 +433,8 @@ pub const Loop = struct {
 
             .connect => |*v| sqe.prep_connect(
                 v.socket,
-                &v.addr.any,
-                v.addr.getOsSockLen(),
+                @ptrCast(&v.addr),
+                @sizeOf(posix.sockaddr.in),
             ),
 
             .poll => |v| {
@@ -651,19 +651,23 @@ pub const Loop = struct {
 /// use the higher-level functions on this structure or the even
 /// higher-level abstractions like the Timer struct.
 pub const Completion = struct {
-    /// Operation to execute. This is only safe to read BEFORE the completion
-    /// is queued. After being queued (with "add"), the operation may change.
-    op: Operation = .{ .noop = {} },
+    /// Internally set. Kept first so loop bookkeeping (next, flags) shares
+    /// cache line 0 with userdata/callback, avoiding a third cache line touch
+    /// in Loop.add() which previously occurred because flags landed just past
+    /// a 64-byte boundary after the large Operation union.
+    next: ?*Completion = null,
+    flags: packed struct(u8) {
+        state: State = .dead,
+        _pad: u7 = 0,
+    } align(8) = .{},
 
     /// Userdata and callback for when the completion is finished.
     userdata: ?*anyopaque = null,
     callback: Callback = noopCallback,
 
-    /// Internally set
-    next: ?*Completion = null,
-    flags: packed struct {
-        state: State = .dead,
-    } = .{},
+    /// Operation to execute. This is only safe to read BEFORE the completion
+    /// is queued. After being queued (with "add"), the operation may change.
+    op: Operation = .{ .noop = {} },
 
     const State = enum(u1) {
         /// completion is not part of any loop
@@ -993,7 +997,7 @@ pub const Operation = union(OperationType) {
 
     connect: struct {
         socket: posix.socket_t,
-        addr: std.net.Address,
+        addr: posix.sockaddr.in,
     },
 
     poll: struct {
@@ -1548,7 +1552,7 @@ test "io_uring: socket accept/connect/send/recv/close" {
         .op = .{
             .connect = .{
                 .socket = client_conn,
-                .addr = address,
+                .addr = address.in.sa,
             },
         },
 

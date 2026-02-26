@@ -711,7 +711,7 @@ pub const Loop = struct {
 
             .connect => |*v| action: {
                 while (true) {
-                    const result = posix.system.connect(v.socket, &v.addr.any, v.addr.getOsSockLen());
+                    const result = posix.system.connect(v.socket, @ptrCast(&v.addr), @sizeOf(posix.sockaddr.in));
                     switch (posix.errno(result)) {
                         // Interrupt, try again
                         .INTR => continue,
@@ -1540,7 +1540,7 @@ pub const Operation = union(OperationType) {
 
     connect: struct {
         socket: posix.socket_t,
-        addr: std.net.Address,
+        addr: posix.sockaddr.in,
     },
 
     read: struct {
@@ -2301,7 +2301,7 @@ test "kqueue: socket accept/connect/send/recv/close" {
         .op = .{
             .connect = .{
                 .socket = client_conn,
-                .addr = address,
+                .addr = address.in.sa,
             },
         },
 

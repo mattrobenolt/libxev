@@ -184,7 +184,7 @@ fn TCPStream(comptime xev: type) type {
             self: Self,
             loop: *xev.Loop,
             c: *xev.Completion,
-            addr: std.net.Address,
+            addr: std.net.Ip4Address,
             comptime Userdata: type,
             userdata: ?*Userdata,
             comptime cb: *const fn (
@@ -199,7 +199,7 @@ fn TCPStream(comptime xev: type) type {
                 .op = .{
                     .connect = .{
                         .socket = self.fd,
-                        .addr = addr,
+                        .addr = addr.sa,
                     },
                 },
 
@@ -488,7 +488,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Connect
             var connected: bool = false;
-            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
@@ -653,7 +653,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Connect
             var connected: bool = false;
-            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
@@ -885,7 +885,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
                 }
             }).callback);
 
-            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
