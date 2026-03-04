@@ -1222,7 +1222,7 @@ test "Completion size" {
     const testing = std.testing;
 
     // Just so we are aware when we change the size
-    try testing.expectEqual(@as(usize, 152), @sizeOf(Completion));
+    try testing.expectEqual(@as(usize, 128), @sizeOf(Completion));
 }
 
 test "io_uring: available" {

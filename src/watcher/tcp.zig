@@ -271,6 +271,83 @@ fn TCPStream(comptime xev: type) type {
             loop.add(c);
         }
 
+        /// Receive data in multishot mode using a buffer from the provided BufferPool.
+        ///
+        /// In multishot mode, the callback is invoked for each incoming chunk of data
+        /// without needing to rearm the operation. Return `.disarm` from the callback
+        /// to stop receiving, or `.rearm` to continue (on io_uring with multishot,
+        /// rearm is automatic while `IORING_CQE_F_MORE` is set; `.rearm` resubmits
+        /// when the multishot terminates, e.g. on buffer exhaustion).
+        ///
+        /// On io_uring (kernel 6.0+), this uses true multishot recv where a single
+        /// submission generates multiple completions as data arrives.
+        ///
+        /// On kqueue, multishot is not supported and this falls back to regular
+        /// single-shot recvWithPool. Return `.rearm` from the callback to receive
+        /// additional data.
+        pub fn recvWithPoolMultishot(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            pool: *xev.BufferPool,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                s: Self,
+                r: xev.RecvPoolError!xev.BufferPool.Recv,
+            ) xev.CallbackAction,
+        ) void {
+            switch (xev.backend) {
+                .io_uring => {
+                    c.* = .{
+                        .op = .{
+                            .recv_pool = .{
+                                .fd = self.fd,
+                                .buffer_group_id = pool.config.group_id,
+                                .pool = pool,
+                                .multishot = true,
+                            },
+                        },
+                        .userdata = userdata,
+                        .callback = (struct {
+                            fn callback(
+                                ud: ?*anyopaque,
+                                l_inner: *xev.Loop,
+                                c_inner: *xev.Completion,
+                                r: xev.Result,
+                            ) xev.CallbackAction {
+                                const op = &c_inner.op.recv_pool;
+                                const pool_ptr: *xev.BufferPool = @ptrCast(@alignCast(op.pool));
+                                const res = r.recv_pool;
+
+                                const user_result: xev.RecvPoolError!xev.BufferPool.Recv = blk: {
+                                    const bytes_read = res.result catch |err| break :blk err;
+                                    const buffer_id = res.cqe.buffer_id() catch break :blk error.NoBuffersAvailable;
+                                    break :blk pool_ptr.getRecvFromResult(buffer_id, bytes_read, res.cqe);
+                                };
+
+                                return @call(.always_inline, cb, .{
+                                    common.userdataValue(Userdata, ud),
+                                    l_inner,
+                                    c_inner,
+                                    initFd(op.fd),
+                                    user_result,
+                                });
+                            }
+                        }).callback,
+                    };
+                },
+                .kqueue => {
+                    // kqueue doesn't support multishot recv; fall back to single-shot.
+                    return self.recvWithPool(loop, c, pool, Userdata, userdata, cb);
+                },
+            }
+            loop.add(c);
+        }
+
         /// Receive data using a buffer from the provided BufferPool.
         /// On io_uring (kernel 6.0+), the kernel selects the buffer from the
         /// registered buffer ring. On kqueue, a buffer is acquired from the
@@ -986,6 +1063,156 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
                 }
             }).callback);
             client.close(&loop, &c_connect, void, null, (struct {
+                fn callback(
+                    _: ?*void,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: Impl,
+                    _: xev.CloseError!void,
+                ) xev.CallbackAction {
+                    return .disarm;
+                }
+            }).callback);
+
+            try loop.run(.until_done);
+        }
+
+        test "TCP: recvWithPoolMultishot" {
+            if (!@hasDecl(Impl, "recvWithPoolMultishot")) return;
+            // Multishot recv is only supported on io_uring
+            if (xev.backend != .io_uring) return;
+
+            const testing = std.testing;
+
+            var tpool = ThreadPool.init(.{});
+            defer tpool.deinit();
+            defer tpool.shutdown();
+            var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
+            defer loop.deinit();
+
+            // Create buffer pool
+            var pool = try xev.BufferPool.init(testing.allocator, .{ .count = 16, .size = 1024 });
+            defer pool.deinit();
+            try pool.register(&loop);
+            defer pool.unregister(&loop);
+
+            // Choose random available port
+            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
+            const server = try Impl.init(address);
+            try server.bind(address);
+            try server.listen(1);
+
+            // Get bound port and create client
+            var sock_len = address.getOsSockLen();
+            try posix.getsockname(server.fd, &address.any, &sock_len);
+            const client = try Impl.init(address);
+
+            // Accept/Connect
+            var c_accept: xev.Completion = undefined;
+            var c_connect: xev.Completion = undefined;
+            var server_conn: ?Impl = null;
+            var connected: bool = false;
+
+            server.accept(&loop, &c_accept, ?Impl, &server_conn, (struct {
+                fn callback(
+                    ud: ?*?Impl,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    r: xev.AcceptError!Impl,
+                ) xev.CallbackAction {
+                    ud.?.* = r catch unreachable;
+                    return .disarm;
+                }
+            }).callback);
+
+            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
+                fn callback(
+                    ud: ?*bool,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: Impl,
+                    r: xev.ConnectError!void,
+                ) xev.CallbackAction {
+                    _ = r catch unreachable;
+                    ud.?.* = true;
+                    return .disarm;
+                }
+            }).callback);
+
+            try loop.run(.until_done);
+            try testing.expect(server_conn != null);
+            try testing.expect(connected);
+
+            // Close the listening server
+            var server_closed = false;
+            server.close(&loop, &c_accept, bool, &server_closed, (struct {
+                fn callback(
+                    ud: ?*bool,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: Impl,
+                    r: xev.CloseError!void,
+                ) xev.CallbackAction {
+                    _ = r catch unreachable;
+                    ud.?.* = true;
+                    return .disarm;
+                }
+            }).callback);
+            try loop.run(.until_done);
+
+            // Track multishot recv completions
+            const State = struct {
+                recv_count: usize = 0,
+                total_bytes: usize = 0,
+                combined: [12]u8 = undefined, // "msg1" + "msg2" + "msg3" = 12
+                got_eof: bool = false,
+            };
+            var state = State{};
+
+            // Start multishot recv before sending data
+            var recv_c: xev.Completion = undefined;
+            server_conn.?.recvWithPoolMultishot(&loop, &recv_c, &pool, State, &state, (struct {
+                fn callback(
+                    ud: ?*State,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: Impl,
+                    r: xev.RecvPoolError!xev.BufferPool.Recv,
+                ) xev.CallbackAction {
+                    const s = ud.?;
+                    if (r) |recv| {
+                        const d = recv.data();
+                        @memcpy(s.combined[s.total_bytes..][0..d.len], d);
+                        s.total_bytes += d.len;
+                        s.recv_count += 1;
+                        recv.release();
+                        return .rearm;
+                    } else |_| {
+                        // EOF or error terminates multishot
+                        s.got_eof = true;
+                        return .disarm;
+                    }
+                }
+            }).callback);
+
+            // Send data directly via posix (avoids event loop contention with multishot)
+            const send_data = "msg1msg2msg3";
+            _ = try posix.send(client.fd, send_data, 0);
+
+            // Close client to trigger EOF on the receiver, which disarms multishot
+            posix.close(client.fd);
+
+            // Run until multishot recv gets EOF and disarms
+            try loop.run(.until_done);
+
+            // Verify we received all data
+            try testing.expect(state.recv_count >= 1);
+            try testing.expect(state.got_eof);
+            try testing.expectEqual(@as(usize, 12), state.total_bytes);
+            try testing.expectEqualSlices(u8, send_data, state.combined[0..state.total_bytes]);
+
+            // Cleanup — client already closed above, just close server conn
+            server_conn.?.close(&loop, &c_accept, void, null, (struct {
                 fn callback(
                     _: ?*void,
                     _: *xev.Loop,
