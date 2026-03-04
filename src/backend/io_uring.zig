@@ -195,10 +195,9 @@ pub const Loop = struct {
                 // Skip completions that were already disarmed (e.g., from a
                 // previous multishot callback returning .disarm). The kernel
                 // may still send CQEs until the operation fully completes.
-                // We still need to decrement active since each CQE corresponds
-                // to a submission that was counted.
+                // Don't decrement active — it was already decremented when
+                // .disarm set the state to .dead.
                 if (c.flags.state == .dead) {
-                    if (!more) self.active -= 1;
                     continue;
                 }
 
