@@ -12,6 +12,10 @@ const queue = @import("../queue.zig");
 const Callback = looppkg.Callback(@This());
 const noopCallback = looppkg.NoopCallback(@This());
 
+// Zig 0.15.2 does not expose the Linux 6.15+ NO_IOWAIT bits yet.
+const IOURING_ENTER_NO_IOWAIT: u32 = 1 << 7;
+const IOURING_FEAT_NO_IOWAIT: u32 = 1 << 17;
+
 /// True if this backend is available on this platform.
 pub fn available() bool {
     if (comptime builtin.os.tag != .linux) return false;
@@ -28,6 +32,22 @@ pub fn available() bool {
     ring.deinit();
 
     return true;
+}
+
+fn ring_submit_and_wait(self: *linux.IoUring, wait_nr: u32) !u32 {
+    const submitted = self.flush_sq();
+    var flags: u32 = 0;
+    if (self.sq_ring_needs_enter(&flags) or wait_nr > 0) {
+        if (wait_nr > 0 or self.flags & linux.IORING_SETUP_IOPOLL != 0) {
+            flags |= linux.IORING_ENTER_GETEVENTS;
+            if (self.features & IOURING_FEAT_NO_IOWAIT != 0) {
+                flags |= IOURING_ENTER_NO_IOWAIT;
+            }
+        }
+        return self.enter(submitted, wait_nr, flags);
+    }
+
+    return submitted;
 }
 
 pub const Loop = struct {
@@ -164,7 +184,7 @@ pub const Loop = struct {
             // of the submit call, because then we can do exactly once syscall
             // to get all our events.
             if (self.submissions.empty()) {
-                _ = self.ring.submit_and_wait(wait) catch |err| switch (err) {
+                _ = ring_submit_and_wait(&self.ring, wait) catch |err| switch (err) {
                     error.SignalInterrupt => continue,
                     else => return err,
                 };
