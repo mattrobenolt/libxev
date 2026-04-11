@@ -49,7 +49,6 @@ pub const File = xev.File;
 pub const Process = xev.Process;
 pub const Timer = xev.Timer;
 pub const TCP = xev.TCP;
-pub const UDP = xev.UDP;
 pub const BufferPool = xev.BufferPool;
 pub const RecvPoolError = xev.RecvPoolError;
 pub const RecvPoolResult = xev.RecvPoolResult;
