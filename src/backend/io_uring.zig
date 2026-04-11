@@ -780,6 +780,7 @@ pub const Completion = struct {
                         .CANCELED => error.Canceled,
                         .CONNRESET => error.ConnectionResetByPeer,
                         .NOBUFS => error.NoBuffersAvailable,
+                        .IO => error.InputOutput,
                         else => |errno| posix.unexpectedErrno(errno),
                     },
                     .cqe = .{ .user_data = 0, .res = res, .flags = cqe_flags },
@@ -891,6 +892,7 @@ pub const Completion = struct {
                         .CANCELED => error.Canceled,
                         .CONNRESET => error.ConnectionResetByPeer,
                         .NOBUFS => error.NoBuffersAvailable,
+                        .IO => error.InputOutput,
                         else => |errno| posix.unexpectedErrno(errno),
                     },
                     .cqe = .{ .user_data = 0, .res = res, .flags = cqe_flags },
@@ -1251,6 +1253,7 @@ pub const RecvPoolError = error{
     Canceled,
     NoBuffersAvailable,
     ConnectionResetByPeer,
+    InputOutput,
     Unexpected,
 };
 
