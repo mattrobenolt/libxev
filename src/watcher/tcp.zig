@@ -498,6 +498,75 @@ fn TCPStream(comptime xev: type) type {
             loop.add(c);
         }
 
+        /// Receive data using recvmsg with a buffer from the provided BufferPool.
+        /// The msghdr is caller-owned and must remain valid until the callback fires.
+        /// The msghdr's iov[0] will be overwritten by the pool buffer on completion.
+        /// The msghdr's control/controllen fields are passed through to the kernel,
+        /// allowing the caller to receive ancillary data (e.g. kTLS record type via cmsg).
+        ///
+        /// Linux/io_uring only. The kernel selects the payload buffer from the
+        /// registered buffer ring (IOSQE_BUFFER_SELECT); the control buffer is caller-owned.
+        pub fn recvmsgWithPool(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            pool: *xev.BufferPool,
+            msghdr: *posix.msghdr,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                s: Self,
+                r: xev.RecvPoolError!xev.BufferPool.Recv,
+            ) xev.CallbackAction,
+        ) void {
+            switch (xev.backend) {
+                .io_uring => {
+                    c.* = .{
+                        .op = .{
+                            .recvmsg = .{
+                                .fd = self.fd,
+                                .msghdr = msghdr,
+                                .buffer_group_id = pool.config.group_id,
+                                .pool = pool,
+                            },
+                        },
+                        .userdata = userdata,
+                        .callback = (struct {
+                            fn callback(
+                                ud: ?*anyopaque,
+                                l_inner: *xev.Loop,
+                                c_inner: *xev.Completion,
+                                r: xev.Result,
+                            ) xev.CallbackAction {
+                                const op = &c_inner.op.recvmsg;
+                                const pool_ptr: *xev.BufferPool = @ptrCast(@alignCast(op.pool.?));
+                                const res = r.recvmsg;
+
+                                const user_result: xev.RecvPoolError!xev.BufferPool.Recv = blk: {
+                                    const bytes_read = res.result catch |err| break :blk err;
+                                    const buffer_id = res.cqe.buffer_id() catch break :blk error.NoBuffersAvailable;
+                                    break :blk pool_ptr.getRecvFromResult(buffer_id, bytes_read, res.cqe);
+                                };
+
+                                return @call(.always_inline, cb, .{
+                                    common.userdataValue(Userdata, ud),
+                                    l_inner,
+                                    c_inner,
+                                    initFd(op.fd),
+                                    user_result,
+                                });
+                            }
+                        }).callback,
+                    };
+                },
+                .kqueue => @compileError("recvmsgWithPool is Linux-only"),
+            }
+            loop.add(c);
+        }
+
         test {
             _ = TCPTests(xev, Self);
         }

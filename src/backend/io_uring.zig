@@ -518,6 +518,10 @@ pub const Loop = struct {
                     v.msghdr,
                     0,
                 );
+                if (v.pool != null) {
+                    sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+                    sqe.buf_index = v.buffer_group_id;
+                }
             },
 
             .send => |*v| switch (v.buffer) {
@@ -767,7 +771,19 @@ pub const Completion = struct {
             },
 
             .recvmsg => .{
-                .recvmsg = self.readResult(.recvmsg, res),
+                .recvmsg = .{
+                    .result = if (res > 0)
+                        @intCast(res)
+                    else if (res == 0)
+                        error.EOF
+                    else switch (@as(posix.E, @enumFromInt(-res))) {
+                        .CANCELED => error.Canceled,
+                        .CONNRESET => error.ConnectionResetByPeer,
+                        .NOBUFS => error.NoBuffersAvailable,
+                        else => |errno| posix.unexpectedErrno(errno),
+                    },
+                    .cqe = .{ .user_data = 0, .res = res, .flags = cqe_flags },
+                },
             },
 
             .send => .{
@@ -943,7 +959,8 @@ pub const OperationType = enum {
     /// Send a message on a socket using sendmsg (i.e. UDP).
     sendmsg,
 
-    /// Recieve a message on a socket using recvmsg (i.e. UDP).
+    /// Receive a message on a socket using recvmsg.
+    /// Supports optional provided buffer pool for payload and cmsg passthrough.
     recvmsg,
 
     /// Shutdown all or part of a full-duplex connection.
@@ -982,7 +999,7 @@ pub const Result = union(OperationType) {
     recv: ReadError!usize,
     send: WriteError!usize,
     sendmsg: WriteError!usize,
-    recvmsg: ReadError!usize,
+    recvmsg: RecvPoolResult,
     shutdown: ShutdownError!void,
     pwrite: WriteError!usize,
     write: WriteError!usize,
@@ -1070,6 +1087,11 @@ pub const Operation = union(OperationType) {
     recvmsg: struct {
         fd: posix.fd_t,
         msghdr: *posix.msghdr,
+        /// When non-null, use provided buffer pool (IOSQE_BUFFER_SELECT).
+        /// The kernel selects a buffer from the pool for the payload iovec;
+        /// the msghdr control buffer remains caller-owned (for cmsg passthrough).
+        buffer_group_id: u16 = 0,
+        pool: ?*anyopaque = null,
     },
 
     shutdown: struct {
