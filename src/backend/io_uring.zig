@@ -781,6 +781,7 @@ pub const Completion = struct {
                         .CONNRESET => error.ConnectionResetByPeer,
                         .NOBUFS => error.NoBuffersAvailable,
                         .IO => error.InputOutput,
+                        .KEYEXPIRED => error.KeyExpired,
                         else => |errno| posix.unexpectedErrno(errno),
                     },
                     .cqe = .{ .user_data = 0, .res = res, .flags = cqe_flags },
@@ -894,6 +895,7 @@ pub const Completion = struct {
                         .CONNRESET => error.ConnectionResetByPeer,
                         .NOBUFS => error.NoBuffersAvailable,
                         .IO => error.InputOutput,
+                        .KEYEXPIRED => error.KeyExpired,
                         else => |errno| posix.unexpectedErrno(errno),
                     },
                     .cqe = .{ .user_data = 0, .res = res, .flags = cqe_flags },
@@ -1256,6 +1258,7 @@ pub const RecvPoolError = error{
     NoBuffersAvailable,
     ConnectionResetByPeer,
     InputOutput,
+    KeyExpired,
     Unexpected,
 };
 
