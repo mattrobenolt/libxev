@@ -1764,6 +1764,14 @@ pub const RecvmsgCmsgResult = struct {
     msg_flags: u32,
 };
 
+/// kqueue does not implement sendmsg with cmsg passthrough; these types
+/// exist only so generic api.zig forwarding compiles. Calling
+/// TCP.sendmsgCmsg on a kqueue build is a compile error.
+pub const SendmsgCmsgResult = struct {
+    written: WriteError!usize,
+    msg_flags: u32,
+};
+
 /// ReadBuffer are the various options for reading.
 pub const ReadBuffer = union(enum) {
     /// Read into this slice.

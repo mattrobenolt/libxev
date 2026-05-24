@@ -645,6 +645,79 @@ fn TCPStream(comptime xev: type) type {
             loop.add(c);
         }
 
+        /// Send data and ancillary (cmsg) bytes via sendmsg(2) using
+        /// caller-supplied payload and cmsg buffers. Symmetric to recvmsgCmsg:
+        /// the library builds the msghdr_const internally; storage for
+        /// msghdr+iov lives inline in the Completion. Both buffers must
+        /// remain valid until the completion fires.
+        ///
+        /// `flags` is passed through to the sendmsg flags argument
+        /// (MSG_NOSIGNAL, MSG_DONTWAIT, etc.). 0 is the common case.
+        ///
+        /// Linux/io_uring only. kqueue is unsupported; calling this on a
+        /// kqueue build is a compile error.
+        pub fn sendmsgCmsg(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            buf: []const u8,
+            cmsg_buf: []const u8,
+            flags: u32,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                s: Self,
+                r: xev.SendmsgCmsgResult,
+            ) xev.CallbackAction,
+        ) void {
+            switch (xev.backend) {
+                .io_uring => {
+                    c.* = .{
+                        .op = .{
+                            .sendmsg_cmsg = .{
+                                .fd = self.fd,
+                                .flags = flags,
+                                .msghdr = undefined,
+                                .iov = undefined,
+                            },
+                        },
+                        .userdata = userdata,
+                        .callback = (struct {
+                            fn callback(
+                                ud: ?*anyopaque,
+                                l_inner: *xev.Loop,
+                                c_inner: *xev.Completion,
+                                r: xev.Result,
+                            ) xev.CallbackAction {
+                                const op = &c_inner.op.sendmsg_cmsg;
+                                return @call(.always_inline, cb, .{
+                                    common.userdataValue(Userdata, ud),
+                                    l_inner,
+                                    c_inner,
+                                    initFd(op.fd),
+                                    r.sendmsg_cmsg,
+                                });
+                            }
+                        }).callback,
+                    };
+                    const op = &c.op.sendmsg_cmsg;
+                    op.iov[0] = .{ .base = buf.ptr, .len = buf.len };
+                    op.msghdr = std.mem.zeroes(posix.msghdr_const);
+                    op.msghdr.iov = &op.iov;
+                    op.msghdr.iovlen = 1;
+                    if (cmsg_buf.len > 0) {
+                        op.msghdr.control = cmsg_buf.ptr;
+                        op.msghdr.controllen = cmsg_buf.len;
+                    }
+                },
+                .kqueue => @compileError("sendmsgCmsg is Linux/io_uring-only"),
+            }
+            loop.add(c);
+        }
+
         test {
             _ = TCPTests(xev, Self);
         }
@@ -1483,6 +1556,136 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             try testing.expectEqual(@as(usize, 0), got.cmsg_len);
 
             // Cleanup.
+            posix.close(client.fd);
+            server.close(&loop, &c_accept, void, null, (struct {
+                fn callback(
+                    _: ?*void,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: Impl,
+                    _: xev.CloseError!void,
+                ) xev.CallbackAction {
+                    return .disarm;
+                }
+            }).callback);
+            server_conn.?.close(&loop, &c_connect, void, null, (struct {
+                fn callback(
+                    _: ?*void,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: Impl,
+                    _: xev.CloseError!void,
+                ) xev.CallbackAction {
+                    return .disarm;
+                }
+            }).callback);
+            try loop.run(.until_done);
+        }
+
+        test "TCP: sendmsgCmsg basic" {
+            if (!@hasDecl(Impl, "sendmsgCmsg")) return;
+            if (xev.backend != .io_uring) return;
+
+            const testing = std.testing;
+
+            var tpool = ThreadPool.init(.{});
+            defer tpool.deinit();
+            defer tpool.shutdown();
+            var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
+            defer loop.deinit();
+
+            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
+            const server = try Impl.init(address);
+            try server.bind(address);
+            try server.listen(1);
+
+            var sock_len = address.getOsSockLen();
+            try posix.getsockname(server.fd, &address.any, &sock_len);
+            const client = try Impl.init(address);
+
+            var c_accept: xev.Completion = undefined;
+            var c_connect: xev.Completion = undefined;
+            var server_conn: ?Impl = null;
+            var connected: bool = false;
+
+            server.accept(&loop, &c_accept, ?Impl, &server_conn, (struct {
+                fn callback(
+                    ud: ?*?Impl,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    r: xev.AcceptError!Impl,
+                ) xev.CallbackAction {
+                    ud.?.* = r catch unreachable;
+                    return .disarm;
+                }
+            }).callback);
+
+            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
+                fn callback(
+                    ud: ?*bool,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: Impl,
+                    r: xev.ConnectError!void,
+                ) xev.CallbackAction {
+                    _ = r catch unreachable;
+                    ud.?.* = true;
+                    return .disarm;
+                }
+            }).callback);
+
+            try loop.run(.until_done);
+            try testing.expect(server_conn != null);
+            try testing.expect(connected);
+
+            // Send via sendmsgCmsg with no ancillary data.
+            const send_buf = "sendmsgCmsg-smoke";
+            const Result = struct {
+                written: usize = 0,
+                msg_flags: u32 = 0,
+                err: ?anyerror = null,
+            };
+            var got = Result{};
+            var c_send: xev.Completion = undefined;
+            client.sendmsgCmsg(
+                &loop,
+                &c_send,
+                send_buf,
+                &.{},
+                0,
+                Result,
+                &got,
+                (struct {
+                    fn callback(
+                        ud: ?*Result,
+                        _: *xev.Loop,
+                        _: *xev.Completion,
+                        _: Impl,
+                        r: xev.SendmsgCmsgResult,
+                    ) xev.CallbackAction {
+                        const s = ud.?;
+                        if (r.written) |n| {
+                            s.written = n;
+                        } else |e| {
+                            s.err = e;
+                        }
+                        s.msg_flags = r.msg_flags;
+                        return .disarm;
+                    }
+                }).callback,
+            );
+
+            try loop.run(.until_done);
+
+            try testing.expect(got.err == null);
+            try testing.expectEqual(send_buf.len, got.written);
+
+            // Verify the server received the payload.
+            var recv_buf: [128]u8 = undefined;
+            const n = try posix.recv(server_conn.?.fd, &recv_buf, 0);
+            try testing.expectEqual(send_buf.len, n);
+            try testing.expectEqualSlices(u8, send_buf, recv_buf[0..n]);
+
             posix.close(client.fd);
             server.close(&loop, &c_accept, void, null, (struct {
                 fn callback(

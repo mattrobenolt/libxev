@@ -532,6 +532,14 @@ pub const Loop = struct {
                 );
             },
 
+            .sendmsg_cmsg => |*v| {
+                sqe.prep_sendmsg(
+                    v.fd,
+                    &v.msghdr,
+                    v.flags,
+                );
+            },
+
             .send => |*v| switch (v.buffer) {
                 .array => |*buf| sqe.prep_send(
                     v.fd,
@@ -827,6 +835,22 @@ pub const Completion = struct {
                 },
             },
 
+            .sendmsg_cmsg => sendmsg_cmsg: {
+                const op = &self.op.sendmsg_cmsg;
+                const written: WriteError!usize = if (res >= 0)
+                    @intCast(res)
+                else switch (@as(posix.E, @enumFromInt(-res))) {
+                    .CANCELED => error.Canceled,
+                    .PIPE => error.BrokenPipe,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    else => |errno| posix.unexpectedErrno(errno),
+                };
+                break :sendmsg_cmsg .{ .sendmsg_cmsg = .{
+                    .written = written,
+                    .msg_flags = if (res >= 0) op.msghdr.flags else 0,
+                } };
+            },
+
             .sendmsg => .{
                 .sendmsg = if (res >= 0)
                     @intCast(res)
@@ -1022,6 +1046,11 @@ pub const OperationType = enum {
     /// payload and ancillary (cmsg) buffers. The msghdr and iovec storage
     /// live inline in the Operation; the buffers themselves are caller-owned.
     recvmsg_cmsg,
+
+    /// Send a message on a socket using sendmsg with caller-supplied
+    /// payload and ancillary (cmsg) buffers. Symmetric to recvmsg_cmsg;
+    /// msghdr_const + iovec_const storage live inline in the Operation.
+    sendmsg_cmsg,
 };
 
 /// The result type based on the operation type. For a callback, the
@@ -1046,6 +1075,7 @@ pub const Result = union(OperationType) {
     cancel: CancelError!void,
     recv_pool: RecvPoolResult,
     recvmsg_cmsg: RecvmsgCmsgResult,
+    sendmsg_cmsg: SendmsgCmsgResult,
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1186,6 +1216,16 @@ pub const Operation = union(OperationType) {
         /// Completion outlives it.
         msghdr: posix.msghdr = undefined,
         iov: [1]posix.iovec = undefined,
+    },
+
+    sendmsg_cmsg: struct {
+        fd: posix.fd_t,
+        flags: u32 = 0,
+        /// Inline storage referenced by the io_uring SQE. Both must outlive
+        /// the in-flight operation, which they do because the enclosing
+        /// Completion outlives it.
+        msghdr: posix.msghdr_const = undefined,
+        iov: [1]posix.iovec_const = undefined,
     },
 };
 
@@ -1332,6 +1372,121 @@ pub const RecvmsgCmsgResult = struct {
     cmsg_len: usize,
     msg_flags: u32,
 };
+
+/// Result of a sendmsg_cmsg operation. `written` is the payload byte count
+/// reported by sendmsg(2); `msg_flags` reflects msghdr.flags after the call.
+pub const SendmsgCmsgResult = struct {
+    written: WriteError!usize,
+    msg_flags: u32,
+};
+
+const CmsgHeader = extern struct {
+    len: usize,
+    level: c_int,
+    kind: c_int,
+};
+
+fn cmsgAlign(len: usize) usize {
+    return std.mem.alignForward(usize, len, @sizeOf(usize));
+}
+
+fn cmsgSpace(comptime T: type) usize {
+    return cmsgAlign(@sizeOf(CmsgHeader)) + cmsgAlign(@sizeOf(T));
+}
+
+fn cmsgData(header: *CmsgHeader) [*]u8 {
+    const bytes: [*]u8 = @ptrCast(header);
+    return bytes + cmsgAlign(@sizeOf(CmsgHeader));
+}
+
+test "io_uring: recvmsg_cmsg receives SCM_RIGHTS" {
+    const testing = std.testing;
+    if (builtin.os.tag != .linux) return;
+
+    var sockets: [2]posix.fd_t = undefined;
+    switch (posix.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets))) {
+        .SUCCESS => {},
+        else => |errno| return posix.unexpectedErrno(errno),
+    }
+    defer posix.close(sockets[0]);
+    defer posix.close(sockets[1]);
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    const payload = "x";
+    var send_iov = [_]posix.iovec_const{.{ .base = payload.ptr, .len = payload.len }};
+    var control: [cmsgSpace(posix.fd_t)]u8 align(@sizeOf(usize)) = @splat(0);
+    const header: *CmsgHeader = @ptrCast(&control);
+    header.* = .{
+        .len = @sizeOf(CmsgHeader) + @sizeOf(posix.fd_t),
+        .level = linux.SOL.SOCKET,
+        .kind = 0x01, // SCM_RIGHTS.
+    };
+    const passed_fd: *posix.fd_t = @ptrCast(@alignCast(cmsgData(header)));
+    passed_fd.* = sockets[0];
+    const send_msg: posix.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &send_iov,
+        .iovlen = send_iov.len,
+        .control = &control,
+        .controllen = control.len,
+        .flags = 0,
+    };
+    try testing.expectEqual(payload.len, try posix.sendmsg(sockets[1], &send_msg, 0));
+
+    const State = struct {
+        bytes: usize = 0,
+        cmsg_len: usize = 0,
+        err: ?anyerror = null,
+    };
+    var state: State = .{};
+    var recv_buf: [8]u8 = undefined;
+    var recv_control: [cmsgSpace(posix.fd_t)]u8 align(@sizeOf(usize)) = @splat(0);
+    var completion: Completion = .{
+        .op = .{ .recvmsg_cmsg = .{ .fd = sockets[0] } },
+        .userdata = &state,
+        .callback = (struct {
+            fn callback(
+                userdata: ?*anyopaque,
+                _: *Loop,
+                _: *Completion,
+                result: Result,
+            ) CallbackAction {
+                const state_inner: *State = @ptrCast(@alignCast(userdata.?));
+                if (result.recvmsg_cmsg.bytes) |bytes| {
+                    state_inner.bytes = bytes;
+                } else |err| {
+                    state_inner.err = err;
+                }
+                state_inner.cmsg_len = result.recvmsg_cmsg.cmsg_len;
+                return .disarm;
+            }
+        }).callback,
+    };
+    completion.op.recvmsg_cmsg.iov[0] = .{ .base = &recv_buf, .len = recv_buf.len };
+    completion.op.recvmsg_cmsg.msghdr = std.mem.zeroes(posix.msghdr);
+    completion.op.recvmsg_cmsg.msghdr.iov = &completion.op.recvmsg_cmsg.iov;
+    completion.op.recvmsg_cmsg.msghdr.iovlen = 1;
+    completion.op.recvmsg_cmsg.msghdr.control = &recv_control;
+    completion.op.recvmsg_cmsg.msghdr.controllen = recv_control.len;
+
+    loop.add(&completion);
+    try loop.run(.until_done);
+
+    try testing.expect(state.err == null);
+    try testing.expectEqual(payload.len, state.bytes);
+    try testing.expectEqualSlices(u8, payload, recv_buf[0..state.bytes]);
+    try testing.expect(state.cmsg_len >= @sizeOf(CmsgHeader) + @sizeOf(posix.fd_t));
+
+    const recv_header: *CmsgHeader = @ptrCast(&recv_control);
+    try testing.expectEqual(@as(c_int, linux.SOL.SOCKET), recv_header.level);
+    try testing.expectEqual(@as(c_int, 0x01), recv_header.kind);
+    const recv_fd: *posix.fd_t = @ptrCast(@alignCast(cmsgData(recv_header)));
+    defer posix.close(recv_fd.*);
+    try testing.expect(recv_fd.* >= 0);
+}
 
 test "Completion size" {
     const testing = std.testing;

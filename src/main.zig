@@ -54,6 +54,7 @@ pub const RecvPoolError = xev.RecvPoolError;
 pub const RecvPoolResult = xev.RecvPoolResult;
 pub const RecvmsgCmsgError = xev.RecvmsgCmsgError;
 pub const RecvmsgCmsgResult = xev.RecvmsgCmsgResult;
+pub const SendmsgCmsgResult = xev.SendmsgCmsgResult;
 
 comptime {
     // This ensures that all the public decls from the API are forwarded
