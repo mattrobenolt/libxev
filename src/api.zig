@@ -45,6 +45,8 @@ pub fn Xev(comptime be: Backend, comptime T: type) type {
         pub const ReadError = T.ReadError;
         pub const RecvPoolError = T.RecvPoolError;
         pub const RecvPoolResult = T.RecvPoolResult;
+        pub const RecvmsgCmsgError = T.RecvmsgCmsgError;
+        pub const RecvmsgCmsgResult = T.RecvmsgCmsgResult;
 
         /// Shared stream types
         const SharedStream = stream.Shared(Self);

@@ -524,6 +524,14 @@ pub const Loop = struct {
                 }
             },
 
+            .recvmsg_cmsg => |*v| {
+                sqe.prep_recvmsg(
+                    v.fd,
+                    &v.msghdr,
+                    v.flags,
+                );
+            },
+
             .send => |*v| switch (v.buffer) {
                 .array => |*buf| sqe.prep_send(
                     v.fd,
@@ -770,6 +778,26 @@ pub const Completion = struct {
                 .recv = self.readResult(.recv, res),
             },
 
+            .recvmsg_cmsg => recvmsg_cmsg: {
+                const op = &self.op.recvmsg_cmsg;
+                const bytes: RecvmsgCmsgError!usize = if (res > 0)
+                    @intCast(res)
+                else if (res == 0)
+                    error.EOF
+                else switch (@as(posix.E, @enumFromInt(-res))) {
+                    .CANCELED => error.Canceled,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .IO => error.InputOutput,
+                    .KEYEXPIRED => error.KeyExpired,
+                    else => |errno| posix.unexpectedErrno(errno),
+                };
+                break :recvmsg_cmsg .{ .recvmsg_cmsg = .{
+                    .bytes = bytes,
+                    .cmsg_len = if (res >= 0) op.msghdr.controllen else 0,
+                    .msg_flags = if (res >= 0) op.msghdr.flags else 0,
+                } };
+            },
+
             .recvmsg => .{
                 .recvmsg = .{
                     .result = if (res > 0)
@@ -989,6 +1017,11 @@ pub const OperationType = enum {
 
     /// Receive with provided buffer pool (kernel 6.0+).
     recv_pool,
+
+    /// Receive a message on a socket using recvmsg with caller-supplied
+    /// payload and ancillary (cmsg) buffers. The msghdr and iovec storage
+    /// live inline in the Operation; the buffers themselves are caller-owned.
+    recvmsg_cmsg,
 };
 
 /// The result type based on the operation type. For a callback, the
@@ -1012,6 +1045,7 @@ pub const Result = union(OperationType) {
     timer_remove: TimerRemoveError!void,
     cancel: CancelError!void,
     recv_pool: RecvPoolResult,
+    recvmsg_cmsg: RecvmsgCmsgResult,
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1143,6 +1177,16 @@ pub const Operation = union(OperationType) {
         /// Requires kernel 6.0+.
         multishot: bool = false,
     },
+
+    recvmsg_cmsg: struct {
+        fd: posix.fd_t,
+        flags: u32 = 0,
+        /// Inline storage referenced by the io_uring SQE. Both must outlive
+        /// the in-flight operation, which they do because the enclosing
+        /// Completion outlives it.
+        msghdr: posix.msghdr = undefined,
+        iov: [1]posix.iovec = undefined,
+    },
 };
 
 /// ReadBuffer are the various options for reading.
@@ -1265,6 +1309,28 @@ pub const RecvPoolError = error{
 pub const RecvPoolResult = struct {
     result: RecvPoolError!usize,
     cqe: linux.io_uring_cqe,
+};
+
+/// Result of a recvmsg_cmsg operation. `bytes` is the payload byte count,
+/// `cmsg_len` is the number of ancillary bytes written into the caller's
+/// cmsg buffer, and `msg_flags` reflects msghdr.flags after the call
+/// (e.g. MSG_CTRUNC indicates the cmsg buffer was too small).
+pub const RecvmsgCmsgError = error{
+    EOF,
+    Canceled,
+    ConnectionResetByPeer,
+    InputOutput,
+    /// kTLS: a non-application-data record (alert, handshake, key update)
+    /// was received. The control message in the caller's cmsg buffer
+    /// identifies the record type via TLS_GET_RECORD_TYPE.
+    KeyExpired,
+    Unexpected,
+};
+
+pub const RecvmsgCmsgResult = struct {
+    bytes: RecvmsgCmsgError!usize,
+    cmsg_len: usize,
+    msg_flags: u32,
 };
 
 test "Completion size" {

@@ -1747,6 +1747,23 @@ pub const RecvPoolResult = struct {
     buffer_id: u16,
 };
 
+/// kqueue does not implement recvmsg with cmsg passthrough; these types
+/// exist only so generic api.zig forwarding compiles. Calling
+/// TCP.recvmsgCmsg on a kqueue build is a compile error.
+pub const RecvmsgCmsgError = error{
+    EOF,
+    Canceled,
+    ConnectionResetByPeer,
+    InputOutput,
+    KeyExpired,
+    Unexpected,
+};
+pub const RecvmsgCmsgResult = struct {
+    bytes: RecvmsgCmsgError!usize,
+    cmsg_len: usize,
+    msg_flags: u32,
+};
+
 /// ReadBuffer are the various options for reading.
 pub const ReadBuffer = union(enum) {
     /// Read into this slice.
