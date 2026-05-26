@@ -1711,5 +1711,59 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             }).callback);
             try loop.run(.until_done);
         }
+
+        // ----------------------------------------------------------------
+        // Semantic coverage notes for cmsg watchers
+        // ----------------------------------------------------------------
+        //
+        // The tests above are wiring-shape smoke tests: they verify the
+        // recvmsgCmsg / sendmsgCmsg API compiles, wires correctly through the
+        // io_uring completion path, and handles the zero-cmsg case. The
+        // following *semantic* behaviors require kernel TLS (kTLS) to be set
+        // up on the socket and are therefore not unit-tested at the libxev
+        // layer:
+        //
+        //   1. MSG_CTRUNC (cmsg_buf too small): only observable when the
+        //      kernel has ancillary data to deliver — which only happens on a
+        //      kTLS socket via TLS_GET_RECORD_TYPE. Without kTLS, the kernel
+        //      never writes control messages into msghdr.control for TCP
+        //      sockets, so a tiny cmsg_buf is harmless and MSG_CTRUNC is never
+        //      set. Coverage is provided by the tls-xev consumer library's
+        //      keyupdate-bail smoke scenario.
+        //
+        //   2. error.KeyExpired (EKEYEXPIRED): the io_uring backend maps this
+        //      errno to error.KeyExpired in RecvmsgCmsgError. It is only
+        //      returned when kTLS surfaces a non-application-data record (e.g.
+        //      a TLS KeyUpdate) without a cmsg buffer attached. Coverage
+        //      requires a live kTLS socket and is exercised by the consuming
+        //      library.
+        //
+        //   3. Populated-cmsg sendmsg roundtrip (TLS_SET_RECORD_TYPE): verifying
+        //      that a cmsg attached to sendmsgCmsg actually causes the receiver
+        //      to see the correct TLS record type requires kTLS on both sides.
+        //      Plain TCP sockets silently ignore control messages on sendmsg.
+        //
+        // The compile-time and error-set checks below verify static properties
+        // that do not require kTLS.
+
+        test "TCP: MSG_CTRUNC constant value" {
+            if (xev.backend != .io_uring) return;
+            // Verify the MSG_CTRUNC value matches the kernel ABI (0x08 / 8).
+            // If the Zig stdlib ever remaps this constant we want an immediate
+            // failure rather than a silent behaviour change in the kTLS path.
+            // std.os.linux.MSG.CTRUNC is a comptime_int; verify its value
+            // matches the kernel ABI (0x08 = 8 on Linux/glibc).
+            try std.testing.expectEqual(@as(u32, 8), @as(u32, std.os.linux.MSG.CTRUNC));
+        }
+
+        test "TCP: RecvmsgCmsgError set contains KeyExpired" {
+            if (xev.backend != .io_uring) return;
+            // Confirm error.KeyExpired is reachable via RecvmsgCmsgError so
+            // that consumer code can match on it without an 'else' branch
+            // silently swallowing it.
+            const err: xev.RecvmsgCmsgError!usize = error.KeyExpired;
+            const caught = err catch |e| e;
+            try std.testing.expectEqual(error.KeyExpired, caught);
+        }
     };
 }
