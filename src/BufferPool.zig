@@ -42,6 +42,24 @@ pub fn BufferPool(comptime xev: type) type {
             group_id: u16 = 0,
         };
 
+        /// How the provided buffer ring was registered with the kernel.
+        pub const RegistrationMode = enum {
+            /// ABI-correct registration with resv zeroed. All correct kernels.
+            standard,
+            /// Compat registration with resv = {1, 1, 1}, for Ubuntu noble 6.8
+            /// kernels with the inverted resv guard (LP#2162843).
+            resv_compat,
+        };
+
+        /// How the io_uring provided buffer ring registered with the kernel.
+        /// Null before register() completes, and always null on kqueue.
+        pub fn registrationMode(self: *const Self) ?RegistrationMode {
+            return switch (xev.backend) {
+                .io_uring => self.impl.registration_mode,
+                .kqueue => null,
+            };
+        }
+
         /// On io_uring, the CQE carries buffer flags needed for correct INC
         /// mode buffer lifecycle (BUF_MORE, res). On kqueue, this is void.
         const Cqe = if (xev.backend == .io_uring) linux.io_uring_cqe else void;
@@ -248,6 +266,9 @@ pub fn BufferPool(comptime xev: type) type {
             /// Null until register() is called.
             buf_group: ?IoUring.BufferGroup = null,
 
+            /// How buf_group was registered. Null until register() is called.
+            registration_mode: ?RegistrationMode = null,
+
             fn init(allocator: Allocator, config: Config) !IoUringImpl {
                 _ = allocator;
                 _ = config;
@@ -258,13 +279,15 @@ pub fn BufferPool(comptime xev: type) type {
             fn register(self: *IoUringImpl, ring: *IoUring, allocator: Allocator, config: Config) !void {
                 if (self.buf_group != null) return error.AlreadyRegistered;
 
-                self.buf_group = try initBufferGroupNoInc(
+                const result = try initBufferGroupNoInc(
                     ring,
                     allocator,
                     config.group_id,
                     config.size,
                     config.count,
                 );
+                self.buf_group = result.group;
+                self.registration_mode = result.mode;
             }
 
             /// Initialize a BufferGroup WITHOUT INC (incremental consumption) mode.
@@ -288,13 +311,14 @@ pub fn BufferPool(comptime xev: type) type {
                 group_id: u16,
                 buffer_size: u32,
                 buffers_count: u16,
-            ) !IoUring.BufferGroup {
+            ) !InitGroupResult {
                 const buffers = try allocator.alloc(u8, buffer_size * buffers_count);
                 errdefer allocator.free(buffers);
                 const heads = try allocator.alloc(u32, buffers_count);
                 errdefer allocator.free(heads);
 
-                const br = try IoUring.setup_buf_ring(ring.fd, buffers_count, group_id, .{ .inc = false });
+                const setup = try setupBufRingCompat(ring.fd, buffers_count, group_id, .{ .inc = false });
+                const br = setup.br;
                 IoUring.buf_ring_init(br);
 
                 const mask = IoUring.buf_ring_mask(buffers_count);
@@ -308,20 +332,118 @@ pub fn BufferPool(comptime xev: type) type {
                 IoUring.buf_ring_advance(br, buffers_count);
 
                 return .{
-                    .ring = ring,
-                    .group_id = group_id,
-                    .br = br,
-                    .buffers = buffers,
-                    .heads = heads,
-                    .buffer_size = buffer_size,
-                    .buffers_count = buffers_count,
+                    .group = .{
+                        .ring = ring,
+                        .group_id = group_id,
+                        .br = br,
+                        .buffers = buffers,
+                        .heads = heads,
+                        .buffer_size = buffer_size,
+                        .buffers_count = buffers_count,
+                    },
+                    .mode = setup.mode,
                 };
+            }
+
+            const InitGroupResult = struct {
+                group: IoUring.BufferGroup,
+                mode: RegistrationMode,
+            };
+
+            /// Register a provided buffer ring, falling back to a non-zero
+            /// resv on kernels that reject the ABI-correct zeroed resv.
+            ///
+            /// Compat for the Ubuntu noble 6.8 stable regression (LP#2162843).
+            /// A Canonical stable backport (cff3ace786c7b513bf65cbf6a51fc92dc53395cc,
+            /// backporting upstream 1724849072854a66861d461b298b04612702d685)
+            /// expanded `!mem_is_zero(reg.resv, ...)` to
+            /// `!memchr_inv(reg.resv, 0, ...)`, keeping the negation that the
+            /// expansion eliminates (mem_is_zero IS !memchr_inv). The resv
+            /// guard is inverted: the kernel rejects ABI-correct zeroed resv
+            /// and accepts any non-zero word.
+            ///
+            /// Affected: Ubuntu 24.04 6.8 kernels from 6.8.0-136-generic and
+            /// the linux-azure/gke/aws flavor ABIs from the same patch window.
+            /// 6.17+ is unaffected: mem_is_zero exists there, so no hand
+            /// expansion happened. The noble git tip carries a fix.
+            ///
+            /// The retry sets all three resv words. That passes both plausible
+            /// inversion flavors ("any non-zero word" and "all words"), and
+            /// every correct kernel rejects it — so when the first EINVAL was
+            /// legitimate, the retry EINVALs too and the original error
+            /// surfaces unchanged.
+            fn setupBufRingCompat(
+                fd: posix.fd_t,
+                entries: u16,
+                group_id: u16,
+                flags: linux.io_uring_buf_reg.Flags,
+            ) !SetupResult {
+                if (IoUring.setup_buf_ring(fd, entries, group_id, flags)) |br| {
+                    return .{ .br = br, .mode = .standard };
+                } else |err| switch (err) {
+                    error.ArgumentsInvalid => {},
+                    else => return err,
+                }
+                const br = try setupBufRingResv(fd, entries, group_id, flags, .{ 1, 1, 1 });
+                return .{ .br = br, .mode = .resv_compat };
+            }
+
+            const SetupResult = struct {
+                br: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
+                mode: RegistrationMode,
+            };
+
+            /// IoUring.setup_buf_ring with a caller-controlled resv — the one
+            /// knob std does not expose. Compat path for the inverted-guard
+            /// kernels described in setupBufRingCompat.
+            fn setupBufRingResv(
+                fd: posix.fd_t,
+                entries: u16,
+                group_id: u16,
+                flags: linux.io_uring_buf_reg.Flags,
+                resv: [3]u64,
+            ) !*align(std.heap.page_size_min) linux.io_uring_buf_ring {
+                // entries were already validated by the std attempt in
+                // setupBufRingCompat before the kernel was consulted.
+                const mmap_size = @as(usize, entries) * @sizeOf(linux.io_uring_buf);
+                const mapping = try posix.mmap(
+                    null,
+                    mmap_size,
+                    posix.PROT.READ | posix.PROT.WRITE,
+                    .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+                    -1,
+                    0,
+                );
+                errdefer posix.munmap(mapping);
+                assert(mapping.len == mmap_size);
+
+                const br: *align(std.heap.page_size_min) linux.io_uring_buf_ring = @ptrCast(mapping.ptr);
+                const reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{
+                    .ring_addr = @intFromPtr(br),
+                    .ring_entries = entries,
+                    .bgid = group_id,
+                    .flags = flags,
+                    .resv = resv,
+                });
+                const rc = linux.io_uring_register(
+                    fd,
+                    .REGISTER_PBUF_RING,
+                    @as(*const anyopaque, @ptrCast(&reg)),
+                    1,
+                );
+                switch (linux.E.init(rc)) {
+                    .SUCCESS => {},
+                    .INVAL => return error.ArgumentsInvalid,
+                    else => |errno| return posix.unexpectedErrno(errno),
+                }
+                return br;
             }
 
             fn unregister(self: *IoUringImpl, allocator: Allocator) void {
                 if (self.buf_group) |*bg| {
                     bg.deinit(allocator);
                     self.buf_group = null;
+                    self.registration_mode = null;
                 }
             }
 
@@ -430,6 +552,23 @@ pub fn BufferPool(comptime xev: type) type {
             const allocator = std.testing.allocator;
             var pool = try Self.init(allocator, .{ .count = 16, .size = 1024 });
             defer pool.deinit();
+        }
+
+        test "BufferPool: register reports a registration mode (io_uring only)" {
+            if (xev.backend != .io_uring) return;
+
+            const allocator = std.testing.allocator;
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var pool = try Self.init(allocator, .{ .count = 16, .size = 1024 });
+            defer pool.deinit();
+
+            try std.testing.expect(pool.registrationMode() == null);
+            try pool.register(&loop);
+            // .standard on correct kernels, .resv_compat on kernels with the
+            // inverted guard. Both mean the ring is usable.
+            try std.testing.expect(pool.registrationMode() != null);
         }
 
         test "BufferPool: init cleans up on OOM (kqueue only)" {
