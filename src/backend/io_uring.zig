@@ -12,7 +12,7 @@ const queue = @import("../queue.zig");
 const Callback = looppkg.Callback(@This());
 const noopCallback = looppkg.NoopCallback(@This());
 
-// Zig 0.15.2 does not expose the Linux 6.15+ NO_IOWAIT bits yet.
+// Zig 0.16 std does not expose the Linux 6.15+ NO_IOWAIT bits yet.
 const IOURING_ENTER_NO_IOWAIT: u32 = 1 << 7;
 const IOURING_FEAT_NO_IOWAIT: u32 = 1 << 17;
 
@@ -144,11 +144,14 @@ pub const Loop = struct {
 
     /// Update the cached time.
     pub fn update_now(self: *Loop) void {
-        if (posix.clock_gettime(posix.CLOCK.MONOTONIC)) |new_time| {
-            self.cached_now = new_time;
-            self.flags.now_outdated = false;
-        } else |_| {
+        var new_time: posix.timespec = undefined;
+        switch (linux.errno(linux.clock_gettime(linux.CLOCK.MONOTONIC, &new_time))) {
+            .SUCCESS => {
+                self.cached_now = new_time;
+                self.flags.now_outdated = false;
+            },
             // Errors are ignored.
+            else => {},
         }
     }
 
@@ -251,6 +254,7 @@ pub const Loop = struct {
     /// We should try again someday.
     pub const SubmitError = error{
         Unexpected,
+        InvalidThread,
         SystemResources,
         FileDescriptorInvalid,
         FileDescriptorInBadState,
@@ -1082,6 +1086,10 @@ pub const Result = union(OperationType) {
 /// backend-specific and therefore the structure and types change depending
 /// on the underlying system in use. The high level operations are
 /// done by initializing the request handles.
+/// How to shut down a socket. Replaces `std.posix.ShutdownHow`, removed in
+/// Zig 0.16; mapped to `linux.SHUT` constants at prep time.
+pub const ShutdownHow = enum { recv, send, both };
+
 pub const Operation = union(OperationType) {
     noop: void,
 
@@ -1165,7 +1173,7 @@ pub const Operation = union(OperationType) {
 
     shutdown: struct {
         socket: posix.socket_t,
-        how: posix.ShutdownHow = .both,
+        how: ShutdownHow = .both,
     },
 
     pwrite: struct {
@@ -1399,17 +1407,58 @@ fn cmsgData(header: *CmsgHeader) [*]u8 {
     return bytes + cmsgAlign(@sizeOf(CmsgHeader));
 }
 
+// --- Test helpers: raw socket ops. The std.posix mid-level wrappers
+// (socket/bind/listen/connect/close) were removed in Zig 0.16, so decode
+// errno ourselves at the raw linux layer.
+
+fn testSa(port: u16) posix.sockaddr.in {
+    return .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
+    };
+}
+
+fn testSocket(extra_flags: u32) !posix.fd_t {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | extra_flags, 0);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |e| posix.unexpectedErrno(e),
+    };
+}
+
+fn testBindListen(fd: posix.fd_t, port: u16, backlog: u31) !void {
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    const sa = testSa(port);
+    switch (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)))) {
+        .SUCCESS => {},
+        else => |e| return posix.unexpectedErrno(e),
+    }
+    switch (linux.errno(linux.listen(fd, backlog))) {
+        .SUCCESS => {},
+        else => |e| return posix.unexpectedErrno(e),
+    }
+}
+
+/// Non-blocking connect; EINPROGRESS is the expected success case.
+fn testConnect(fd: posix.fd_t, port: u16) !void {
+    const sa = testSa(port);
+    switch (linux.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)))) {
+        .SUCCESS, .INPROGRESS => {},
+        else => |e| return posix.unexpectedErrno(e),
+    }
+}
+
 test "io_uring: recvmsg_cmsg receives SCM_RIGHTS" {
     const testing = std.testing;
     if (builtin.os.tag != .linux) return;
 
     var sockets: [2]posix.fd_t = undefined;
-    switch (posix.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets))) {
+    switch (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets))) {
         .SUCCESS => {},
         else => |errno| return posix.unexpectedErrno(errno),
     }
-    defer posix.close(sockets[0]);
-    defer posix.close(sockets[1]);
+    defer _ = linux.close(sockets[0]);
+    defer _ = linux.close(sockets[1]);
 
     var loop = try Loop.init(.{});
     defer loop.deinit();
@@ -1434,7 +1483,12 @@ test "io_uring: recvmsg_cmsg receives SCM_RIGHTS" {
         .controllen = control.len,
         .flags = 0,
     };
-    try testing.expectEqual(payload.len, try posix.sendmsg(sockets[1], &send_msg, 0));
+    const sent_rc = linux.sendmsg(sockets[1], @ptrCast(&send_msg), 0);
+    const sent = switch (linux.errno(sent_rc)) {
+        .SUCCESS => sent_rc,
+        else => |e| return posix.unexpectedErrno(e),
+    };
+    try testing.expectEqual(payload.len, sent);
 
     const State = struct {
         bytes: usize = 0,
@@ -1484,7 +1538,7 @@ test "io_uring: recvmsg_cmsg receives SCM_RIGHTS" {
     try testing.expectEqual(@as(c_int, linux.SOL.SOCKET), recv_header.level);
     try testing.expectEqual(@as(c_int, 0x01), recv_header.kind);
     const recv_fd: *posix.fd_t = @ptrCast(@alignCast(cmsgData(recv_header)));
-    defer posix.close(recv_fd.*);
+    defer _ = linux.close(recv_fd.*);
     try testing.expect(recv_fd.* >= 0);
 }
 
@@ -1773,8 +1827,6 @@ test "io_uring: timer remove" {
 }
 
 test "io_uring: socket accept/connect/send/recv/close" {
-    const mem = std.mem;
-    const net = std.net;
     const os = posix;
     const testing = std.testing;
 
@@ -1782,17 +1834,14 @@ test "io_uring: socket accept/connect/send/recv/close" {
     defer loop.deinit();
 
     // Create a TCP server socket
-    const address = try net.Address.parseIp4("127.0.0.1", 3131);
     const kernel_backlog = 1;
-    var ln = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
-    errdefer os.close(ln);
-    try os.setsockopt(ln, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
-    try os.bind(ln, &address.any, address.getOsSockLen());
-    try os.listen(ln, kernel_backlog);
+    var ln = try testSocket(0);
+    errdefer _ = linux.close(ln);
+    try testBindListen(ln, 3131, kernel_backlog);
 
     // Create a TCP client socket
-    var client_conn = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
-    errdefer os.close(client_conn);
+    var client_conn = try testSocket(0);
+    errdefer _ = linux.close(client_conn);
 
     // Accept
     var server_conn: os.socket_t = 0;
@@ -1822,7 +1871,7 @@ test "io_uring: socket accept/connect/send/recv/close" {
         .op = .{
             .connect = .{
                 .socket = client_conn,
-                .addr = address.in.sa,
+                .addr = testSa(3131),
             },
         },
 
@@ -1998,21 +2047,16 @@ test "io_uring: socket accept/connect/send/recv/close" {
 }
 
 test "io_uring: multishot accept" {
-    const net = std.net;
     const os = posix;
     const testing = std.testing;
-    const mem = std.mem;
 
     var loop = try Loop.init(.{});
     defer loop.deinit();
 
     // Create a TCP server socket
-    const address = try net.Address.parseIp4("127.0.0.1", 3139);
-    const ln = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
-    defer os.close(ln);
-    try os.setsockopt(ln, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
-    try os.bind(ln, &address.any, address.getOsSockLen());
-    try os.listen(ln, 8);
+    const ln = try testSocket(0);
+    defer _ = linux.close(ln);
+    try testBindListen(ln, 3139, 8);
 
     // Track accepted connections
     const State = struct {
@@ -2050,13 +2094,12 @@ test "io_uring: multishot accept" {
     // Create 3 client connections
     var clients: [3]os.socket_t = undefined;
     for (&clients) |*client| {
-        client.* = try os.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC | os.SOCK.NONBLOCK, 0);
-        os.connect(client.*, &address.any, address.getOsSockLen()) catch |err| switch (err) {
-            error.WouldBlock => {},
-            else => return err,
-        };
+        client.* = try testSocket(linux.SOCK.NONBLOCK);
+        try testConnect(client.*, 3139);
     }
-    defer for (clients) |client| os.close(client);
+    defer {
+        for (clients) |client| _ = linux.close(client);
+    }
 
     // Run until all accepts complete
     try loop.run(.until_done);
@@ -2065,7 +2108,7 @@ test "io_uring: multishot accept" {
     try testing.expectEqual(@as(usize, 3), state.accept_count);
     for (state.connections) |conn| {
         try testing.expect(conn > 0);
-        os.close(conn);
+        _ = linux.close(conn);
     }
 }
 
@@ -2077,9 +2120,13 @@ test "io_uring: multishot poll" {
     defer loop.deinit();
 
     // Create a pipe for testing poll
-    const pipe = try os.pipe2(.{ .NONBLOCK = true });
-    defer os.close(pipe[0]);
-    defer os.close(pipe[1]);
+    var pipe: [2]os.fd_t = undefined;
+    switch (linux.errno(linux.pipe2(&pipe, .{ .NONBLOCK = true }))) {
+        .SUCCESS => {},
+        else => |e| return posix.unexpectedErrno(e),
+    }
+    defer _ = linux.close(pipe[0]);
+    defer _ = linux.close(pipe[1]);
 
     const State = struct {
         poll_count: usize = 0,
@@ -2112,7 +2159,10 @@ test "io_uring: multishot poll" {
 
     // Write data multiple times to trigger poll events
     for (0..3) |_| {
-        _ = try os.write(pipe[1], "x");
+        switch (linux.errno(linux.write(pipe[1], "x", 1))) {
+            .SUCCESS => {},
+            else => |e| return posix.unexpectedErrno(e),
+        }
         try loop.run(.once);
         // Read to reset the poll state
         var buf: [1]u8 = undefined;

@@ -37,8 +37,29 @@
 const ThreadPool = @This();
 
 const std = @import("std");
+const linux = std.os.linux;
 const assert = std.debug.assert;
 const Atomic = std.atomic.Value;
+
+/// Raw futex wait/wake. `std.Thread.Futex` was removed in Zig 0.16 and its
+/// replacement lives behind `std.Io`, which this pool has no instance of.
+/// This fork is Linux-only, so syscall directly.
+fn futexWait(ptr: *const Atomic(u32), expected: u32) void {
+    while (true) {
+        const rc = linux.futex_4arg(ptr, .{ .cmd = .WAIT, .private = true }, expected, null);
+        switch (linux.errno(rc)) {
+            // AGAIN: value changed before we slept. SUCCESS: woken. Either
+            // way the caller reloads state after we return.
+            .AGAIN, .SUCCESS => return,
+            .INTR => continue,
+            else => unreachable,
+        }
+    }
+}
+
+fn futexWake(ptr: *const Atomic(u32), max_waiters: u32) void {
+    _ = linux.futex_3arg(ptr, .{ .cmd = .WAKE, .private = true }, max_waiters);
+}
 
 stack_size: u32,
 max_threads: u32,
@@ -487,7 +508,7 @@ const Event = struct {
             // Acquiring to WAITING will make the next notify() or shutdown() wake a sleeping futex thread
             // who will either exit on SHUTDOWN or acquire with WAITING again, ensuring all threads are awoken.
             // This unfortunately results in the last notify() or shutdown() doing an extra futex wake but that's fine.
-            std.Thread.Futex.wait(&self.state, WAITING);
+            futexWait(&self.state, WAITING);
             state = self.state.load(.monotonic);
             acquire_with = WAITING;
         }
@@ -513,7 +534,7 @@ const Event = struct {
         // Only wake threads sleeping in futex if the state is WAITING.
         // Avoids unnecessary wake ups.
         if (state == WAITING) {
-            std.Thread.Futex.wake(&self.state, wake_threads);
+            futexWake(&self.state, wake_threads);
         }
     }
 };

@@ -32,8 +32,8 @@ pub fn main() !void {
     defer pool.unregister(&loop);
 
     // Create and bind the server socket
-    const address = try std.net.Address.parseIp4("127.0.0.1", 3000);
-    const server = try xev.TCP.init(address);
+    const address: std.Io.net.Ip4Address = try .parse("127.0.0.1", 3000);
+    const server = try xev.TCP.init();
     try server.bind(address);
     try server.listen(128);
 

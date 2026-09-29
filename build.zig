@@ -26,14 +26,7 @@ pub fn build(b: *std.Build) !void {
         true
     else |err| switch (err) {
         error.FileNotFound => false,
-        else => return err,
     };
-
-    const emit_bench = b.option(
-        bool,
-        "emit-bench",
-        "Install the benchmark binaries to zig-out",
-    ) orelse false;
 
     const emit_examples = b.option(
         bool,
@@ -44,8 +37,7 @@ pub fn build(b: *std.Build) !void {
     // Man pages
     const man = try manPages(b);
 
-    // Benchmarks and examples
-    const benchmarks = try buildBenchmarks(b, target);
+    // Examples
     const examples = try buildExamples(b, target, optimize);
 
     // Test Executable
@@ -62,12 +54,12 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/main.zig"),
                 .target = target,
                 .optimize = optimize,
+                .link_libc = switch (target.result.os.tag) {
+                    .linux, .macos => true,
+                    else => null,
+                },
             }),
         });
-        switch (target.result.os.tag) {
-            .linux, .macos => test_exe.linkLibC(),
-            else => {},
-        }
         break :test_exe test_exe;
     };
 
@@ -82,14 +74,6 @@ pub fn build(b: *std.Build) !void {
     if (emit_man) {
         for (man) |step| b.getInstallStep().dependOn(step);
     }
-    if (emit_bench) for (benchmarks) |exe| {
-        b.getInstallStep().dependOn(&b.addInstallArtifact(
-            exe,
-            .{ .dest_dir = .{ .override = .{
-                .custom = "bin/bench",
-            } } },
-        ).step);
-    };
     if (emit_examples) for (examples) |exe| {
         b.getInstallStep().dependOn(&b.addInstallArtifact(
             exe,
@@ -98,55 +82,6 @@ pub fn build(b: *std.Build) !void {
             } } },
         ).step);
     };
-}
-
-fn buildBenchmarks(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-) ![]const *Step.Compile {
-    const alloc = b.allocator;
-    var steps: std.ArrayList(*Step.Compile) = .empty;
-    defer steps.deinit(alloc);
-
-    var dir = try std.fs.cwd().openDir(try b.build_root.join(
-        b.allocator,
-        &.{ "src", "bench" },
-    ), .{ .iterate = true });
-    defer dir.close();
-
-    // Go through and add each as a step
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        // Get the index of the last '.' so we can strip the extension.
-        const index = std.mem.lastIndexOfScalar(
-            u8,
-            entry.name,
-            '.',
-        ) orelse continue;
-        if (index == 0) continue;
-
-        // Name of the app and full path to the entrypoint.
-        const name = entry.name[0..index];
-
-        // Executable builder.
-        const exe = b.addExecutable(.{
-            .name = name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(b.fmt(
-                    "src/bench/{s}",
-                    .{entry.name},
-                )),
-                .target = target,
-                .optimize = .ReleaseFast, // benchmarks are always release fast
-            }),
-        });
-        exe.root_module.addImport("xev", b.modules.get("xev").?);
-
-        // Store the mapping
-        try steps.append(alloc, exe);
-    }
-
-    return steps.toOwnedSlice(alloc);
 }
 
 fn buildExamples(
@@ -158,17 +93,18 @@ fn buildExamples(
     var steps: std.ArrayList(*Step.Compile) = .empty;
     defer steps.deinit(alloc);
 
-    var dir = try std.fs.cwd().openDir(try b.build_root.join(
+    const io = b.graph.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, try b.build_root.join(
         b.allocator,
         &.{"examples"},
     ), .{ .iterate = true });
-    defer dir.close();
+    defer dir.close(io);
 
     // Go through and add each as a step
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         // Get the index of the last '.' so we can strip the extension.
-        const index = std.mem.lastIndexOfScalar(
+        const index = std.mem.findScalarLast(
             u8,
             entry.name,
             '.',
@@ -208,14 +144,15 @@ fn manPages(b: *std.Build) ![]const *Step {
     var steps: std.ArrayList(*Step) = .empty;
     defer steps.deinit(alloc);
 
-    var dir = try std.fs.cwd().openDir(try b.build_root.join(
+    const io = b.graph.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, try b.build_root.join(
         b.allocator,
         &.{"docs"},
     ), .{ .iterate = true });
-    defer dir.close();
+    defer dir.close(io);
 
     var it = dir.iterate();
-    while (try it.next()) |*entry| {
+    while (try it.next(io)) |*entry| {
         // Filenames must end in "{section}.scd" and sections are
         // single numerals.
         const base = entry.name[0 .. entry.name.len - 4];
@@ -227,7 +164,7 @@ fn manPages(b: *std.Build) ![]const *Step {
         ) });
 
         try steps.append(alloc, &b.addInstallFile(
-            cmd.captureStdOut(),
+            cmd.captureStdOut(.{}),
             b.fmt("share/man/man{s}/{s}", .{ section, base }),
         ).step);
     }
