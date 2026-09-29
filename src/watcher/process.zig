@@ -34,7 +34,7 @@ fn ProcessPidFd(comptime xev: type) type {
             // Note: SOCK_NONBLOCK == PIDFD_NONBLOCK but we should PR that
             // over to Zig.
             const res = linux.pidfd_open(pid, posix.SOCK.NONBLOCK);
-            const fd = switch (posix.errno(res)) {
+            const fd = switch (linux.errno(res)) {
                 .SUCCESS => @as(posix.fd_t, @intCast(res)),
                 .INVAL => return error.InvalidArgument,
                 .MFILE => return error.ProcessFdQuotaExceeded,
@@ -51,7 +51,7 @@ fn ProcessPidFd(comptime xev: type) type {
 
         /// Clean up the process watcher.
         pub fn deinit(self: *Self) void {
-            std.posix.close(self.fd);
+            _ = linux.close(self.fd);
         }
 
         /// Wait for the process to exit. This will automatically call
@@ -94,9 +94,9 @@ fn ProcessPidFd(comptime xev: type) type {
                             // We need to wait on the pidfd because it is noted as ready
                             const fd = c_inner.op.poll.fd;
                             var info: linux.siginfo_t = undefined;
-                            const res = linux.waitid(.PIDFD, fd, &info, linux.W.EXITED);
+                            const res = linux.waitid(.PIDFD, fd, &info, linux.W.EXITED, null);
 
-                            break :arg switch (posix.errno(res)) {
+                            break :arg switch (linux.errno(res)) {
                                 .SUCCESS => @as(u32, @intCast(info.fields.common.second.sigchld.status)),
                                 .CHILD => error.InvalidChild,
 
@@ -222,15 +222,12 @@ fn ProcessTests(
 
         test "process wait" {
             const testing = std.testing;
-            const alloc = testing.allocator;
-
-            var child = std.process.Child.init(argv_0, alloc);
-            try child.spawn();
+            const child = try std.process.spawn(std.testing.io, .{ .argv = argv_0 });
 
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var p = try Impl.init(child.id);
+            var p = try Impl.init(child.id.?);
             defer p.deinit();
 
             // Wait
@@ -255,15 +252,12 @@ fn ProcessTests(
 
         test "process wait with non-zero exit code" {
             const testing = std.testing;
-            const alloc = testing.allocator;
-
-            var child = std.process.Child.init(argv_42, alloc);
-            try child.spawn();
+            const child = try std.process.spawn(std.testing.io, .{ .argv = argv_42 });
 
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var p = try Impl.init(child.id);
+            var p = try Impl.init(child.id.?);
             defer p.deinit();
 
             // Wait
@@ -288,18 +282,15 @@ fn ProcessTests(
 
         test "process wait on a process that already exited" {
             const testing = std.testing;
-            const alloc = testing.allocator;
-
-            var child = std.process.Child.init(argv_0, alloc);
-            try child.spawn();
+            var child = try std.process.spawn(std.testing.io, .{ .argv = argv_0 });
 
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var p = try Impl.init(child.id);
+            var p = try Impl.init(child.id.?);
             defer p.deinit();
 
-            _ = try child.wait();
+            _ = try child.wait(std.testing.io);
 
             // Wait
             var code: ?u32 = null;

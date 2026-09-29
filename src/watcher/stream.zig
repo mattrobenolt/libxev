@@ -966,7 +966,7 @@ const Pty = struct {
     }
 
     pub fn deinit(self: *Pty) void {
-        std.posix.close(self.parent);
-        std.posix.close(self.child);
+        _ = std.os.linux.close(self.parent);
+        _ = std.os.linux.close(self.child);
     }
 };

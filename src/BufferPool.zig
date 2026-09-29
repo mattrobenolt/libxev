@@ -409,7 +409,7 @@ pub fn BufferPool(comptime xev: type) type {
                 const mapping = try posix.mmap(
                     null,
                     mmap_size,
-                    posix.PROT.READ | posix.PROT.WRITE,
+                    .{ .READ = true, .WRITE = true },
                     .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
                     -1,
                     0,
@@ -431,7 +431,7 @@ pub fn BufferPool(comptime xev: type) type {
                     @as(*const anyopaque, @ptrCast(&reg)),
                     1,
                 );
-                switch (linux.E.init(rc)) {
+                switch (linux.errno(rc)) {
                     .SUCCESS => {},
                     .INVAL => return error.ArgumentsInvalid,
                     else => |errno| return posix.unexpectedErrno(errno),

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const common = @import("common.zig");
 const assert = std.debug.assert;
 const posix = std.posix;
+const linux = std.os.linux;
 const main = @import("../main.zig");
 const stream = @import("stream.zig");
 
@@ -51,15 +52,15 @@ fn FileStream(comptime xev: type) type {
         pub const writeInit = S.writeInit;
         pub const queueWrite = S.queueWrite;
 
-        /// Initialize a File from a std.fs.File.
-        pub fn init(file: std.fs.File) !Self {
+        /// Initialize a File from a std.Io.File.
+        pub fn init(file: std.Io.File) !Self {
             return .{
                 .fd = file.handle,
             };
         }
 
         /// Initialize a File from a file descriptor.
-        pub fn initFd(fd: std.fs.File.Handle) Self {
+        pub fn initFd(fd: std.Io.File.Handle) Self {
             return .{
                 .fd = fd,
             };
@@ -327,9 +328,16 @@ fn FileTests(
             defer loop.deinit();
 
             // Create our pipe and write to it so its ready to be read
-            const pipe = try posix.pipe2(.{ .CLOEXEC = true });
-            defer posix.close(pipe[1]);
-            _ = try posix.write(pipe[1], "x");
+            var pipe: [2]posix.fd_t = undefined;
+            switch (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true }))) {
+                .SUCCESS => {},
+                else => |e| return posix.unexpectedErrno(e),
+            }
+            defer _ = linux.close(pipe[1]);
+            switch (linux.errno(linux.write(pipe[1], "x", 1))) {
+                .SUCCESS => {},
+                else => |e| return posix.unexpectedErrno(e),
+            }
 
             // Create our file
             const file = Impl.initFd(pipe[0]);
@@ -364,9 +372,16 @@ fn FileTests(
             defer loop.deinit();
 
             // Create our pipe and write to it so its ready to be read
-            const pipe = try posix.pipe2(.{ .CLOEXEC = true });
-            defer posix.close(pipe[1]);
-            _ = try posix.write(pipe[1], "x");
+            var pipe: [2]posix.fd_t = undefined;
+            switch (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true }))) {
+                .SUCCESS => {},
+                else => |e| return posix.unexpectedErrno(e),
+            }
+            defer _ = linux.close(pipe[1]);
+            switch (linux.errno(linux.write(pipe[1], "x", 1))) {
+                .SUCCESS => {},
+                else => |e| return posix.unexpectedErrno(e),
+            }
 
             // Create our file
             const file = Impl.initFd(pipe[0]);
@@ -404,12 +419,13 @@ fn FileTests(
 
             // Create our file
             const path = "test_watcher_file";
-            const f = try std.fs.cwd().createFile(path, .{
+            const io = std.testing.io;
+            const f = try std.Io.Dir.cwd().createFile(io, path, .{
                 .read = true,
                 .truncate = true,
             });
-            defer f.close();
-            defer std.fs.cwd().deleteFile(path) catch {};
+            defer f.close(io);
+            defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
             const file = try Impl.init(f);
 
@@ -434,10 +450,10 @@ fn FileTests(
             try loop.run(.until_done);
 
             // Make sure the data is on disk
-            try f.sync();
+            try f.sync(io);
 
-            const f2 = try std.fs.cwd().openFile(path, .{});
-            defer f2.close();
+            const f2 = try std.Io.Dir.cwd().openFile(io, path, .{});
+            defer f2.close(io);
             const file2 = try Impl.init(f2);
 
             // Read
@@ -473,12 +489,13 @@ fn FileTests(
 
             // Create our file
             const path = "test_watcher_file";
-            const f = try std.fs.cwd().createFile(path, .{
+            const io = std.testing.io;
+            const f = try std.Io.Dir.cwd().createFile(io, path, .{
                 .read = true,
                 .truncate = true,
             });
-            defer f.close();
-            defer std.fs.cwd().deleteFile(path) catch {};
+            defer f.close(io);
+            defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
             const file = try Impl.init(f);
 
@@ -503,10 +520,10 @@ fn FileTests(
             try loop.run(.until_done);
 
             // Make sure the data is on disk
-            try f.sync();
+            try f.sync(io);
 
-            const f2 = try std.fs.cwd().openFile(path, .{});
-            defer f2.close();
+            const f2 = try std.Io.Dir.cwd().openFile(io, path, .{});
+            defer f2.close(io);
             const file2 = try Impl.init(f2);
 
             var read_buf: [128]u8 = undefined;
@@ -540,12 +557,13 @@ fn FileTests(
 
             // Create our file
             const path = "test_watcher_file";
-            const f = try std.fs.cwd().createFile(path, .{
+            const io = std.testing.io;
+            const f = try std.Io.Dir.cwd().createFile(io, path, .{
                 .read = true,
                 .truncate = true,
             });
-            defer f.close();
-            defer std.fs.cwd().deleteFile(path) catch {};
+            defer f.close(io);
+            defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
             const file = try Impl.init(f);
             var write_queue: xev.WriteQueue = .{};
@@ -599,10 +617,10 @@ fn FileTests(
             try loop.run(.until_done);
 
             // Make sure the data is on disk
-            try f.sync();
+            try f.sync(io);
 
-            const f2 = try std.fs.cwd().openFile(path, .{});
-            defer f2.close();
+            const f2 = try std.Io.Dir.cwd().openFile(io, path, .{});
+            defer f2.close(io);
             const file2 = try Impl.init(f2);
 
             // Read

@@ -19,14 +19,14 @@ pub const Timerfd = struct {
         flags: linux.TFD,
     ) !Timerfd {
         const res = linux.timerfd_create(clock, flags);
-        return switch (posix.errno(res)) {
+        return switch (linux.errno(res)) {
             .SUCCESS => .{ .fd = @as(i32, @intCast(res)) },
             else => error.UnknownError,
         };
     }
 
     pub fn deinit(self: *Timerfd) void {
-        posix.close(self.fd);
+        _ = linux.close(self.fd);
         self.* = undefined;
     }
 
@@ -44,7 +44,7 @@ pub const Timerfd = struct {
             @as(?*linux.itimerspec, @ptrCast(old_value)),
         );
 
-        return switch (posix.errno(res)) {
+        return switch (linux.errno(res)) {
             .SUCCESS => {},
             else => error.UnknownError,
         };
@@ -54,7 +54,7 @@ pub const Timerfd = struct {
     pub fn get(self: *const Timerfd) !Spec {
         var out: Spec = undefined;
         const res = linux.timerfd_gettime(self.fd, @as(*linux.itimerspec, @ptrCast(&out)));
-        return switch (posix.errno(res)) {
+        return switch (linux.errno(res)) {
             .SUCCESS => out,
             else => error.UnknownError,
         };

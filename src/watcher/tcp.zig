@@ -1,10 +1,70 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const posix = std.posix;
+const linux = std.os.linux;
 
 const ThreadPool = @import("../ThreadPool.zig");
 const common = @import("common.zig");
 const stream = @import("stream.zig");
+
+/// This fork is IPv4-only (exosphere binds and connects IPv4 backends).
+/// `std.net` was removed in Zig 0.16; `std.Io.net.Ip4Address` is the
+/// replacement type.
+const Ip4Address = std.Io.net.Ip4Address;
+
+/// Kernel form of an IPv4 address for bind(2)/connect(2).
+pub fn sockaddrIn(addr: Ip4Address) posix.sockaddr.in {
+    return .{
+        .port = std.mem.nativeToBig(u16, addr.port),
+        .addr = @bitCast(addr.bytes),
+    };
+}
+
+fn rawSocket(flags: u32) !posix.fd_t {
+    const rc = linux.socket(linux.AF.INET, flags, 0);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOMEM => error.SystemResources,
+        .PROTONOSUPPORT => error.ProtocolNotSupported,
+        .INVAL => unreachable, // statically valid flags
+        else => |e| posix.unexpectedErrno(e),
+    };
+}
+
+fn rawBind(fd: posix.fd_t, sa: *const posix.sockaddr.in) !void {
+    const rc = linux.bind(fd, @ptrCast(sa), @sizeOf(posix.sockaddr.in));
+    return switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .ADDRINUSE => error.AddressInUse,
+        .ADDRNOTAVAIL => error.AddressNotAvailable,
+        else => |e| posix.unexpectedErrno(e),
+    };
+}
+
+fn rawListen(fd: posix.fd_t, backlog: u32) !void {
+    return switch (linux.errno(linux.listen(fd, backlog))) {
+        .SUCCESS => {},
+        .ADDRINUSE => error.AddressInUse,
+        else => |e| posix.unexpectedErrno(e),
+    };
+}
+
+/// Re-resolve a listener's kernel-assigned address (bound with port 0)
+/// via getsockname(2). Test helper.
+fn boundAddress(fd: posix.fd_t) !Ip4Address {
+    var sa: posix.sockaddr.in = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    switch (linux.errno(linux.getsockname(fd, @ptrCast(&sa), &len))) {
+        .SUCCESS => {},
+        else => |e| return posix.unexpectedErrno(e),
+    }
+    return .{
+        .bytes = @bitCast(sa.addr),
+        .port = std.mem.bigToNative(u16, sa.port),
+    };
+}
 
 /// TCP client and server.
 ///
@@ -38,23 +98,19 @@ fn TCPStream(comptime xev: type) type {
         pub const writeInit = S.writeInit;
         pub const queueWrite = S.queueWrite;
 
-        /// Initialize a new TCP with the family from the given address. Only
-        /// the family is used, the actual address has no impact on the created
-        /// resource.
-        pub fn init(addr: std.net.Address) !Self {
-            const fd = fd: {
-                // On io_uring we don't use non-blocking sockets because we may
-                // just get EAGAIN over and over from completions.
-                const flags = flags: {
-                    var flags: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-                    if (xev.backend != .io_uring) flags |= posix.SOCK.NONBLOCK;
-                    break :flags flags;
-                };
-                break :fd try posix.socket(addr.any.family, flags, 0);
+        /// Initialize a new TCP socket. IPv4-only fork: the family is always
+        /// AF.INET.
+        pub fn init() !Self {
+            // On io_uring we don't use non-blocking sockets because we may
+            // just get EAGAIN over and over from completions.
+            const flags = flags: {
+                var flags: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+                if (xev.backend != .io_uring) flags |= posix.SOCK.NONBLOCK;
+                break :flags flags;
             };
 
             return .{
-                .fd = fd,
+                .fd = try rawSocket(flags),
             };
         }
 
@@ -66,15 +122,15 @@ fn TCPStream(comptime xev: type) type {
         }
 
         /// Bind the address to the socket.
-        pub fn bind(self: Self, addr: std.net.Address) !void {
+        pub fn bind(self: Self, addr: Ip4Address) !void {
             try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-            try posix.bind(self.fd, &addr.any, addr.getOsSockLen());
+            try rawBind(self.fd, &sockaddrIn(addr));
         }
 
         /// Listen for connections on the socket. This puts the socket into passive
         /// listening mode. Connections must still be accepted one at a time.
         pub fn listen(self: Self, backlog: u31) !void {
-            try posix.listen(self.fd, backlog);
+            try rawListen(self.fd, backlog);
         }
 
         /// Accept a single connection.
@@ -184,7 +240,7 @@ fn TCPStream(comptime xev: type) type {
             self: Self,
             loop: *xev.Loop,
             c: *xev.Completion,
-            addr: std.net.Ip4Address,
+            addr: Ip4Address,
             comptime Userdata: type,
             userdata: ?*Userdata,
             comptime cb: *const fn (
@@ -199,7 +255,7 @@ fn TCPStream(comptime xev: type) type {
                 .op = .{
                     .connect = .{
                         .socket = self.fd,
-                        .addr = addr.sa,
+                        .addr = sockaddrIn(addr),
                     },
                 },
 
@@ -748,18 +804,16 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             defer loop.deinit();
 
             // Choose random available port (Zig #14907)
-            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
-            const server = try Impl.init(address);
+            var address: Ip4Address = try .parse("127.0.0.1", 0);
+            const server = try Impl.init();
 
             // Bind and listen
             try server.bind(address);
             try server.listen(1);
 
             // Retrieve bound port and initialize client
-            var sock_len = address.getOsSockLen();
-            const fd = server.fd;
-            try posix.getsockname(fd, &address.any, &sock_len);
-            const client = try Impl.init(address);
+            address = try boundAddress(server.fd);
+            const client = try Impl.init();
 
             //const address = try std.net.Address.parseIp4("127.0.0.1", 3132);
             //var server = try Impl.init(address);
@@ -785,7 +839,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Connect
             var connected: bool = false;
-            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
@@ -918,17 +972,16 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             defer loop.deinit();
 
             // Choose random available port (Zig #14907)
-            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
-            const server = try Impl.init(address);
+            var address: Ip4Address = try .parse("127.0.0.1", 0);
+            const server = try Impl.init();
 
             // Bind and listen
             try server.bind(address);
             try server.listen(1);
 
             // Retrieve bound port and initialize client
-            var sock_len = address.getOsSockLen();
-            try posix.getsockname(server.fd, &address.any, &sock_len);
-            const client = try Impl.init(address);
+            address = try boundAddress(server.fd);
+            const client = try Impl.init();
 
             // Completions we need
             var c_accept: xev.Completion = undefined;
@@ -950,7 +1003,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Connect
             var connected: bool = false;
-            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
@@ -1153,16 +1206,14 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             defer pool.unregister(&loop);
 
             // Choose random available port
-            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
-            const server = try Impl.init(address);
+            var address: Ip4Address = try .parse("127.0.0.1", 0);
+            const server = try Impl.init();
             try server.bind(address);
             try server.listen(1);
 
             // Get bound port and create client
-            var sock_len = address.getOsSockLen();
-            const fd = server.fd;
-            try posix.getsockname(fd, &address.any, &sock_len);
-            const client = try Impl.init(address);
+            address = try boundAddress(server.fd);
+            const client = try Impl.init();
 
             // Accept/Connect
             var c_accept: xev.Completion = undefined;
@@ -1182,7 +1233,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
                 }
             }).callback);
 
-            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
@@ -1317,15 +1368,14 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             defer pool.unregister(&loop);
 
             // Choose random available port
-            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
-            const server = try Impl.init(address);
+            var address: Ip4Address = try .parse("127.0.0.1", 0);
+            const server = try Impl.init();
             try server.bind(address);
             try server.listen(1);
 
             // Get bound port and create client
-            var sock_len = address.getOsSockLen();
-            try posix.getsockname(server.fd, &address.any, &sock_len);
-            const client = try Impl.init(address);
+            address = try boundAddress(server.fd);
+            const client = try Impl.init();
 
             // Accept/Connect
             var c_accept: xev.Completion = undefined;
@@ -1345,7 +1395,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
                 }
             }).callback);
 
-            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
@@ -1415,12 +1465,15 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
                 }
             }).callback);
 
-            // Send data directly via posix (avoids event loop contention with multishot)
+            // Send data directly via raw syscall (avoids event loop contention with multishot)
             const send_data = "msg1msg2msg3";
-            _ = try posix.send(client.fd, send_data, 0);
+            switch (linux.errno(linux.sendto(client.fd, send_data.ptr, send_data.len, 0, null, 0))) {
+                .SUCCESS => {},
+                else => |e| return posix.unexpectedErrno(e),
+            }
 
             // Close client to trigger EOF on the receiver, which disarms multishot
-            posix.close(client.fd);
+            _ = linux.close(client.fd);
 
             // Run until multishot recv gets EOF and disarms
             try loop.run(.until_done);
@@ -1459,14 +1512,13 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
             defer loop.deinit();
 
-            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
-            const server = try Impl.init(address);
+            var address: Ip4Address = try .parse("127.0.0.1", 0);
+            const server = try Impl.init();
             try server.bind(address);
             try server.listen(1);
 
-            var sock_len = address.getOsSockLen();
-            try posix.getsockname(server.fd, &address.any, &sock_len);
-            const client = try Impl.init(address);
+            address = try boundAddress(server.fd);
+            const client = try Impl.init();
 
             var c_accept: xev.Completion = undefined;
             var c_connect: xev.Completion = undefined;
@@ -1485,7 +1537,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
                 }
             }).callback);
 
-            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
@@ -1505,7 +1557,10 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Send plain data (no cmsg) from client.
             const send_buf = "recvmsgCmsg-smoke";
-            _ = try posix.send(client.fd, send_buf, 0);
+            switch (linux.errno(linux.sendto(client.fd, send_buf.ptr, send_buf.len, 0, null, 0))) {
+                .SUCCESS => {},
+                else => |e| return posix.unexpectedErrno(e),
+            }
 
             // Receive via recvmsgCmsg.
             const Result = struct {
@@ -1556,7 +1611,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             try testing.expectEqual(@as(usize, 0), got.cmsg_len);
 
             // Cleanup.
-            posix.close(client.fd);
+            _ = linux.close(client.fd);
             server.close(&loop, &c_accept, void, null, (struct {
                 fn callback(
                     _: ?*void,
@@ -1594,14 +1649,13 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
             defer loop.deinit();
 
-            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
-            const server = try Impl.init(address);
+            var address: Ip4Address = try .parse("127.0.0.1", 0);
+            const server = try Impl.init();
             try server.bind(address);
             try server.listen(1);
 
-            var sock_len = address.getOsSockLen();
-            try posix.getsockname(server.fd, &address.any, &sock_len);
-            const client = try Impl.init(address);
+            address = try boundAddress(server.fd);
+            const client = try Impl.init();
 
             var c_accept: xev.Completion = undefined;
             var c_connect: xev.Completion = undefined;
@@ -1620,7 +1674,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
                 }
             }).callback);
 
-            client.connect(&loop, &c_connect, address.in, bool, &connected, (struct {
+            client.connect(&loop, &c_connect, address, bool, &connected, (struct {
                 fn callback(
                     ud: ?*bool,
                     _: *xev.Loop,
@@ -1682,11 +1736,15 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
 
             // Verify the server received the payload.
             var recv_buf: [128]u8 = undefined;
-            const n = try posix.recv(server_conn.?.fd, &recv_buf, 0);
+            const recv_rc = linux.recvfrom(server_conn.?.fd, &recv_buf, recv_buf.len, 0, null, null);
+            const n = switch (linux.errno(recv_rc)) {
+                .SUCCESS => recv_rc,
+                else => |e| return posix.unexpectedErrno(e),
+            };
             try testing.expectEqual(send_buf.len, n);
             try testing.expectEqualSlices(u8, send_buf, recv_buf[0..n]);
 
-            posix.close(client.fd);
+            _ = linux.close(client.fd);
             server.close(&loop, &c_accept, void, null, (struct {
                 fn callback(
                     _: ?*void,

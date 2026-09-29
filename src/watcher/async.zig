@@ -2,6 +2,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const posix = std.posix;
+const linux = std.os.linux;
 
 const darwin = @import("../darwin.zig");
 const common = @import("common.zig");
@@ -30,18 +31,22 @@ fn AsyncEventFd(comptime xev: type) type {
         /// Create a new async. An async can be assigned to exactly one loop
         /// to be woken up. The completion must be allocated in advance.
         pub fn init() !Self {
-            return .{
-                .fd = try std.posix.eventfd(
-                    0,
-                    std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
-                ),
+            const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+            const fd: posix.fd_t = switch (linux.errno(rc)) {
+                .SUCCESS => @intCast(rc),
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NOMEM => return error.SystemResources,
+                .INVAL => unreachable, // statically valid flags
+                else => |e| return posix.unexpectedErrno(e),
             };
+            return .{ .fd = fd };
         }
 
         /// Clean up the async. This will forcibly deinitialize any resources
         /// and may result in erroneous wait callbacks to be fired.
         pub fn deinit(self: *Self) void {
-            std.posix.close(self.fd);
+            _ = linux.close(self.fd);
         }
 
         /// Wait for a message on this async. Note that async messages may be
@@ -173,10 +178,12 @@ fn AsyncEventFd(comptime xev: type) type {
         pub fn notify(self: Self) !void {
             // We want to just write "1" in the correct byte order as our host.
             const val = @as([8]u8, @bitCast(@as(u64, 1)));
-            _ = posix.write(self.fd, &val) catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => return err,
-            };
+            switch (linux.errno(linux.write(self.fd, &val, val.len))) {
+                .SUCCESS => {},
+                // A full eventfd is itself a successful wakeup signal.
+                .AGAIN => return,
+                else => |e| return posix.unexpectedErrno(e),
+            }
         }
 
         test {
