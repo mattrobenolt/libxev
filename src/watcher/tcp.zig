@@ -1048,7 +1048,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
                 &std.mem.toBytes(@as(c_int, 8192)),
             );
 
-            const send_buf = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 0 } ** 100_000;
+            const send_buf: [1_000_000]u8 = @splat(0);
             var sent_unqueued: usize = 0;
 
             // First we try to send the whole 1MB buffer in one write operation, this _should_ result

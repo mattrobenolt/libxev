@@ -26,15 +26,11 @@
       {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            zig_0_15
-            zls_0_15
+            zig_0_17
+            zls_0_17
             ziglint
             zigdoc
           ];
-
-          shellHook = ''
-            unset ZIG_GLOBAL_CACHE_DIR
-          '';
         };
       }
     );

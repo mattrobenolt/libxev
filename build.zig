@@ -19,14 +19,10 @@ pub fn build(b: *std.Build) !void {
         bool,
         "emit-man-pages",
         "Set to true to build man pages. Requires scdoc. Defaults to true if scdoc is found.",
-    ) orelse if (b.findProgram(
-        &[_][]const u8{"scdoc"},
-        &[_][]const u8{},
-    )) |_|
+    ) orelse if (b.findProgram(.{ .names = &.{"scdoc"} })) |_|
         true
-    else |err| switch (err) {
-        error.FileNotFound => false,
-    };
+    else
+        false;
 
     const emit_examples = b.option(
         bool,
@@ -87,17 +83,15 @@ pub fn build(b: *std.Build) !void {
 fn buildExamples(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) ![]const *Step.Compile {
     const alloc = b.allocator;
     var steps: std.ArrayList(*Step.Compile) = .empty;
     defer steps.deinit(alloc);
 
     const io = b.graph.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, try b.build_root.join(
-        b.allocator,
-        &.{"examples"},
-    ), .{ .iterate = true });
+    b.dependOnDirectoryContents(b.path("examples"));
+    var dir = try b.root.openDir(io, "examples", .{ .iterate = true });
     defer dir.close(io);
 
     // Go through and add each as a step
@@ -145,10 +139,8 @@ fn manPages(b: *std.Build) ![]const *Step {
     defer steps.deinit(alloc);
 
     const io = b.graph.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, try b.build_root.join(
-        b.allocator,
-        &.{"docs"},
-    ), .{ .iterate = true });
+    b.dependOnDirectoryContents(b.path("docs"));
+    var dir = try b.root.openDir(io, "docs", .{ .iterate = true });
     defer dir.close(io);
 
     var it = dir.iterate();
