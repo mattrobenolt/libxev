@@ -180,7 +180,7 @@ pub const Loop = struct {
                     // If we're deleting then we create a deletion event and
                     // queue the completion to notify cancellation.
                     .deleting => if (c.kevent()) |ev| {
-                        const ecanceled = -1 * @as(i32, @intCast(@intFromEnum(posix.system.E.CANCELED)));
+                        const ecanceled = -1 * @as(i32, @intCast(@backingInt(posix.system.E.CANCELED)));
                         c.result = c.syscall_result(ecanceled);
                         c.flags.state = .dead;
                         self.completions.push(c);
@@ -851,7 +851,7 @@ pub const Loop = struct {
                     // We use EPERM as a way to note there is no thread
                     // pool. We can change this in the future if there is
                     // a better choice.
-                    const eperm = -1 * @as(i32, @intCast(@intFromEnum(posix.system.E.PERM)));
+                    const eperm = -1 * @as(i32, @intCast(@backingInt(posix.system.E.PERM)));
                     c.result = c.syscall_result(eperm);
                     self.completions.push(c);
                     return false;
@@ -1294,7 +1294,7 @@ pub const Completion = struct {
     /// in the situation that kqueue fails to enqueue the completion or
     /// a raw syscall fails.
     fn syscall_result(c: *Completion, r: i32) Result {
-        const errno: posix.E = if (r >= 0) .SUCCESS else @enumFromInt(-r);
+        const errno: posix.E = if (r >= 0) .SUCCESS else @fromBackingInt(@intCast(-r));
         return switch (c.op) {
             .noop => unreachable,
 
@@ -2644,7 +2644,7 @@ test "kqueue: mach port" {
         darwin.KernE.SUCCESS,
         darwin.getKernError(posix.system.mach_port_allocate(
             mach_self,
-            @intFromEnum(posix.system.MACH_PORT_RIGHT.RECEIVE),
+            @backingInt(posix.system.MACH_PORT_RIGHT.RECEIVE),
             &mach_port,
         )),
     );
@@ -2685,7 +2685,7 @@ test "kqueue: mach port" {
 
     // Send a message to the port
     var msg: darwin.mach_msg_header_t = .{
-        .msgh_bits = @intFromEnum(posix.system.MACH_MSG_TYPE.MAKE_SEND_ONCE),
+        .msgh_bits = @backingInt(posix.system.MACH_MSG_TYPE.MAKE_SEND_ONCE),
         .msgh_size = @sizeOf(darwin.mach_msg_header_t),
         .msgh_remote_port = mach_port,
         .msgh_local_port = darwin.MACH_PORT_NULL,
@@ -2735,7 +2735,7 @@ test "kqueue: timer armed from delayed callback must not fire early" {
         darwin.KernE.SUCCESS,
         darwin.getKernError(posix.system.mach_port_allocate(
             mach_self,
-            @intFromEnum(posix.system.MACH_PORT_RIGHT.RECEIVE),
+            @backingInt(posix.system.MACH_PORT_RIGHT.RECEIVE),
             &mach_port,
         )),
     );
@@ -2796,7 +2796,7 @@ test "kqueue: timer armed from delayed callback must not fire early" {
             std.Thread.sleep(send_delay_ms * std.time.ns_per_ms);
 
             var msg: darwin.mach_msg_header_t = .{
-                .msgh_bits = @intFromEnum(posix.system.MACH_MSG_TYPE.MAKE_SEND_ONCE),
+                .msgh_bits = @backingInt(posix.system.MACH_MSG_TYPE.MAKE_SEND_ONCE),
                 .msgh_size = @sizeOf(darwin.mach_msg_header_t),
                 .msgh_remote_port = port,
                 .msgh_local_port = darwin.MACH_PORT_NULL,
